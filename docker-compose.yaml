@@ -1,0 +1,19 @@
+services:
+  fla:
+    build: ./
+    container_name: fla_c
+    #environment:
+    #  - DISPLAY=$DISPLAY
+    shm_size: '8gb'
+    volumes:
+      - .:/FLA
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    stdin_open: true # docker run -i
+    tty: true        # docker run -t
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+#              device_ids: ['0']
+              count: all
