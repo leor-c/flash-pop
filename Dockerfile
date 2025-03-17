@@ -8,7 +8,7 @@ RUN pip install transformers
 RUN pip install datasets
 #RUN pip install causal-conv1d
 
- RUN pip uninstall fla && pip install -U git+https://github.com/leor-c/flash-linear-attention
+RUN pip uninstall fla && pip install -U git+https://github.com/leor-c/flash-linear-attention
 
 RUN pip install tilelang
 # https://github.com/tile-ai/tilelang/issues/147 :
