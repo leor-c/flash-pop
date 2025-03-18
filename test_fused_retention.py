@@ -1,16 +1,19 @@
 import argparse
+from functools import partial
+
 from dataclasses import dataclass
 from math import ceil
 
 import torch
 import tilelang
 import tilelang.language as T
+from tilelang.profiler import do_bench
 from einops import rearrange
 
 # from fla.ops.linear_attn import fused_chunk_linear_attn as chunk_linear_attn
 # from fla.ops.linear_attn import chunk_linear_attn
 
-from fused_retention import fused_retention_fwd, ref_program, _get_decay_mask
+from fused_retention import fused_chunk_retention, ref_program, _get_decay_mask
 
 
 
@@ -54,30 +57,20 @@ def generate_inputs(cfg: Config, apply_layer_norm: bool):
     qk_shape = (cfg.batch_size, cfg.seq_len, cfg.num_heads, cfg.dim_qk)
     v_shape = (cfg.batch_size, cfg.seq_len, cfg.num_heads, cfg.dim_v)
     ln = torch.nn.LayerNorm(cfg.dim_v, device="cuda", dtype=cfg.dtype) if apply_layer_norm else lambda x: x
-    head_decays = get_decays(num_heads=cfg.num_heads, decay_range=cfg.decay_range)
+    head_decays = tuple(get_decays(num_heads=cfg.num_heads, decay_range=cfg.decay_range).cpu().numpy().tolist())
     # head_decays = torch.zeros_like(head_decays)
     ins = [
         ln(torch.randn(qk_shape, device="cuda", dtype=cfg.dtype)),
-        ln(torch.randn(qk_shape, device="cuda", dtype=cfg.dtype)) / (cfg.dim_qk ** 0.5),
+        ln(torch.randn(qk_shape, device="cuda", dtype=cfg.dtype)),
         ln(torch.randn(v_shape, device="cuda", dtype=cfg.dtype)),
         torch.zeros((cfg.batch_size, cfg.num_heads, cfg.dim_qk, cfg.dim_v), device="cuda", dtype=cfg.dtype),
         head_decays,
-        _get_decay_mask(head_decays, cfg.block_T)
     ]
     return ins
 
 
-def compute_forward(cfg: Config, apply_layer_norm: bool):
-    program = fused_retention_fwd(
-        cfg.batch_size, cfg.num_heads, cfg.seq_len, cfg.dim_qk, cfg.dim_v, cfg.block_K, cfg.block_V, cfg.block_T
-    )
-    mod, params = tilelang.lower(program)
-    mod = tilelang.Profiler(mod, params, [6, 7], tilelang.TensorSupplyType.Normal)
-
-    # Construct input:
-    inputs = generate_inputs(cfg, apply_layer_norm)
-
-    ins32 = [v.clone().float() for v in inputs]
+def compute_forward(inputs: list):
+    ins32 = [v.clone().float() if isinstance(v, torch.Tensor) else v for v in inputs]
 
     # Compute reference outputs:
     ref_outs, ref_state = ref_program(*inputs)
@@ -86,23 +79,27 @@ def compute_forward(cfg: Config, apply_layer_norm: bool):
     torch.cuda.synchronize()
 
     # Compute Tilelang outputs:
-    lib_outs, lib_state = mod.func(*inputs)
+    dtype = ins32[0].dtype
+    lib_outs, lib_state = fused_chunk_retention(*inputs)
     torch.cuda.synchronize()
-    lib_outs = lib_outs.float().sum(0).to(dtype=cfg.dtype)
+    lib_outs = lib_outs.float().sum(0).to(dtype=dtype)
     # gn = torch.nn.LayerNorm(normalized_shape=dim_v, device="cuda", dtype=io_dtype)
     # lib_outs = gn(lib_outs)
-    lib_state = lib_state.float().sum(0).to(dtype=cfg.dtype)
+    lib_state = lib_state.float().sum(0).to(dtype=dtype)
 
-    return mod, lib_outs, lib_state, ref_outs, ref_state, ref32_outs, ref32_state
+    return lib_outs, lib_state, ref_outs, ref_state, ref32_outs, ref32_state
 
 
-def benchmark_run_times(cfg: Config, mod):
+def benchmark_run_times(cfg: Config):
     total_flops = 2.0 * cfg.batch_size * cfg.num_heads * cfg.seq_len * cfg.seq_len * (cfg.dim_qk + cfg.dim_v)
     print("Caveat: TFLOPs might be misleading here, but the larger the faster..")
-    latency = mod.do_bench(ref_program, n_warmup=10, n_repeat=10, profiler="torch")
+
+    inputs = generate_inputs(cfg, apply_layer_norm=False)
+
+    latency = do_bench(partial(ref_program, *inputs))
     print("Ref: {:.2f} ms".format(latency))
     print("Ref: {:.2f} TFlops".format(total_flops / latency * 1e-9))
-    latency = mod.do_bench(mod, n_warmup=10, n_repeat=10, profiler="torch")
+    latency = do_bench(partial(fused_chunk_retention, *inputs))
     print("tilelang: {:.2f} ms".format(latency))
     print("tilelang: {:.2f} TFlops".format(total_flops / latency * 1e-9))
 
@@ -122,7 +119,7 @@ def evaluate_states(kernel_state, ref_state, ref32_state):
 def evaluate_outputs(cfg, kernel_outs, ref_outs, ref32_outs):
     assert kernel_outs.shape == (cfg.batch_size, cfg.seq_len, cfg.num_heads, cfg.dim_v)
     assert kernel_outs.shape == ref_outs.shape
-    print(f"Relative error: ", get_err_ratio(kernel_outs, ref_outs))
+    print(f"Relative error: ", get_err_ratio(kernel_outs, ref32_outs))
     print("If it is < 0.005, it is okayish")
     print(f"Max/Avg Abs error: {get_max_abs_err(kernel_outs, ref_outs)}/{get_mean_abs_err(kernel_outs, ref_outs)}")
     print(f"Abs error ref32-ref: {get_max_abs_err(ref32_outs, ref_outs.to(dtype=torch.float32))}/{get_mean_abs_err(ref32_outs, ref_outs.to(dtype=torch.float32))}")
@@ -138,6 +135,16 @@ def evaluate_outputs(cfg, kernel_outs, ref_outs, ref32_outs):
     print(f"Tile: {kernel_outs.flatten()[:10]}")
 
 
+def run_from_cfg(cfg: Config, inputs):
+
+    kernel_outs, kernel_state, ref_outs, ref_state, ref32_outs, ref32_state = compute_forward(inputs)
+
+    evaluate_states(kernel_state, ref_state, ref32_state)
+
+    evaluate_outputs(cfg, kernel_outs, ref_outs, ref32_outs)
+
+    benchmark_run_times(cfg)
+
 
 def test_single_chunk_forward():
     cfg = Config(
@@ -152,16 +159,28 @@ def test_single_chunk_forward():
         decay_range=(5, 12),
     )
 
-    mod, kernel_outs, kernel_state, ref_outs, ref_state, ref32_outs, ref32_state = compute_forward(cfg, apply_layer_norm=False)
-
-    evaluate_states(kernel_state, ref_state, ref32_state)
-
-    evaluate_outputs(cfg, kernel_outs, ref_outs, ref32_outs)
-
-    benchmark_run_times(cfg, mod)
+    inputs = generate_inputs(cfg, False)
+    run_from_cfg(cfg, inputs)
 
 
-def test_multi_chunk_forward():
+def test_multi_chunk_small_batch_forward():
+    cfg = Config(
+        batch_size=8,
+        num_heads=4,
+        seq_len=2048,
+        dim_qk=64,
+        dim_v=128,
+        block_K=64,
+        block_V=64,
+        block_T=64,
+        decay_range=(5, 12),
+    )
+
+    inputs = generate_inputs(cfg, False)
+    run_from_cfg(cfg, inputs)
+
+
+def test_multi_chunk_large_batch_forward():
     cfg = Config(
         batch_size=128,
         num_heads=4,
@@ -174,18 +193,14 @@ def test_multi_chunk_forward():
         decay_range=(5, 12),
     )
 
-    mod, kernel_outs, kernel_state, ref_outs, ref_state, ref32_outs, ref32_state = compute_forward(cfg, apply_layer_norm=False)
-
-    evaluate_states(kernel_state, ref_state, ref32_state)
-
-    evaluate_outputs(cfg, kernel_outs, ref_outs, ref32_outs)
-
-    benchmark_run_times(cfg, mod)
+    inputs = generate_inputs(cfg, False)
+    run_from_cfg(cfg, inputs)
 
 
 
 if __name__ == "__main__":
     # test_single_chunk_forward()
-    test_multi_chunk_forward()
+    test_multi_chunk_small_batch_forward()
+    # test_multi_chunk_large_batch_forward()
 
 
