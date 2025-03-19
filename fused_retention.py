@@ -41,10 +41,8 @@ def fused_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
             k: T.int32
     ):
         # Compute chunk attention scores (within chunk):
-        #       Compute attn. scores + apply mask + normalization:
         T.clear(acc_A_local)
         T.gemm(Q_shared, K_shared, acc_A_local, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
-        # sqrt_dim_qk = T.pow(dim_qk, 0.5)
         for i, j in T.Parallel(BT, BT):
             acc_A_local[i, j] = (acc_A_local[i, j] / sqrt_dim_qk) * mask[i, j]
             # acc_A_local[i, j] = T.if_then_else(i >= j, acc_A_local[i, j] * T.pow(decay, i - j), 0)
@@ -54,7 +52,7 @@ def fused_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
         T.clear(acc_o_local)
         T.gemm(Q_shared, acc_s_shared, acc_o_local, policy=T.GemmWarpPolicy.FullCol)
         for i, j in T.Parallel(BT, BV):
-            acc_o_local[i, j] = acc_o_local[i, j] * (mask[i, 0] * decay)  #decay_BT[i]
+            acc_o_local[i, j] = acc_o_local[i, j] * (mask[i, 0] * decay)
 
         T.gemm(acc_A_cast, V_shared, acc_o_local, policy=T.GemmWarpPolicy.FullCol)
 
@@ -71,15 +69,16 @@ def fused_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
             acc_s_local: T.Buffer([BK, BV], accum_dtype),
             acc_s_shared: T.Buffer([BK, BV], dtype),
             decay: T.float32,
+            effective_chunk_size_correction: T.int32
     ):
         # transpose k first because T.gemm does not have a good support for transposing the first operand according to the authors
-        # sqrt_dim_qk = T.pow(dim_qk, 0.5)
+        c = effective_chunk_size_correction  # if last chunk is shorter (c>0), decays exponents should be adjusted
         for i, j in T.Parallel(BK, BT):
             # Also apply decay terms:
-            K_local_trans[i, j] = (K_shared[j, i] / sqrt_dim_qk) * mask[BT-1, j]  # T.pow(decay, BT - j - 1)
+            K_local_trans[i, j] = (K_shared[j, i] / sqrt_dim_qk) * mask[BT-1, j+c]  # T.pow(decay, BT - j - 1)
         T.copy(K_local_trans, K_local_trans_cast)
 
-        cross_chunk_decay = mask[BT - 1, 0] * decay  # T.pow(decay, BT)
+        cross_chunk_decay = mask[BT - 1, c] * decay  # T.pow(decay, BT)
         for i, j in T.Parallel(BK, BV):
             acc_s_local[i, j] = acc_s_local[i, j] * cross_chunk_decay
         T.gemm(K_local_trans_cast, V_shared, acc_s_local, policy=T.GemmWarpPolicy.FullCol)
@@ -124,12 +123,8 @@ def fused_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
             })
 
             T.clear(acc_s_local)
-            # if use_state:
             T.copy(state[i_batch, i_head, i_bk * BK:(i_bk + 1) * BK, i_bv * BV:(i_bv + 1) * BV], acc_s_shared)
             T.copy(acc_s_shared, acc_s_local)
-            # else:
-            #     T.fill(acc_s_local, 0)
-            #     T.copy(acc_s_local, acc_s_shared)
 
             # init decay values:
             T.copy(head_decays[:heads], decays_shared)
@@ -144,6 +139,7 @@ def fused_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
                 T.copy(K[i_batch, k * BT:(k + 1) * BT, i_head, i_bk * BK:(i_bk + 1) * BK], K_shared)
                 T.copy(Q[i_batch, k * BT:(k + 1) * BT, i_head, i_bk * BK:(i_bk + 1) * BK], Q_shared)
                 T.copy(V[i_batch, k * BT:(k + 1) * BT, i_head, i_bv * BV:(i_bv + 1) * BV], V_shared)
+                effective_chunk_size_correction = T.max(0, ((k+1)*BT) - seq_len)
 
                 compute_retention_chunk_outputs(
                     acc_A_local,
@@ -169,6 +165,7 @@ def fused_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
                     acc_s_local,
                     acc_s_shared,
                     decay,
+                    effective_chunk_size_correction
                 )
             T.copy(acc_s_shared, out_state[i_bk, i_batch, i_head, i_bk * BK:(i_bk + 1) * BK, i_bv * BV:(i_bv + 1) * BV])
 
@@ -245,8 +242,6 @@ def _get_decay_mask(head_decays, seq_len, device="cuda", dtype=torch.float32):
 
 
 def ref_program_(Q, K, V, prev_state, head_decays):
-    sqrt_dim_qk = torch.sqrt(Q.new_tensor(Q.size(3)))
-    # K = K/sqrt_dim_qk
     qk = torch.einsum('bqhd,bkhd->bhqk', Q, K).tril()
 
     from einops import rearrange, einsum
@@ -294,10 +289,9 @@ def ref_program_(Q, K, V, prev_state, head_decays):
 def ref_program(Q, K, V, prev_state, head_decays, *args):
     seq_len = Q.size(1)
     res = []
-    chunk_size = 64
+    chunk_size = 512
     state_t = prev_state
     K = K / (K.size(3) ** 0.5)
-    # gn = torch.nn.GroupNorm(num_groups=Q.size(2), num_channels=Q.size(3), device=Q.device, dtype=Q.dtype)
     # gn = torch.nn.LayerNorm(normalized_shape=V.size(3), device=Q.device, dtype=Q.dtype)
     for i in range(ceil(seq_len / chunk_size)):
         start, end = i * chunk_size, (i + 1) * chunk_size
