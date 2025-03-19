@@ -18,7 +18,7 @@ logger.add(sys.stderr, level="INFO")
 # from fla.ops.linear_attn import fused_chunk_linear_attn as chunk_linear_attn
 # from fla.ops.linear_attn import chunk_linear_attn
 
-from fused_retention import fused_chunk_retention, ref_program, _get_decay_mask
+from fused_retention import fused_chunk_retention, ref_program
 
 
 
@@ -79,10 +79,14 @@ def compute_forward(inputs: list):
     ins32 = [v.clone().float() if isinstance(v, torch.Tensor) else v for v in inputs]
 
     # Compute reference outputs:
-    ref_outs, ref_state = ref_program(*inputs)
-    torch.cuda.synchronize()
-    ref32_outs, ref32_state = ref_program(*ins32)
-    torch.cuda.synchronize()
+    try:
+        ref_outs, ref_state = ref_program(*inputs)
+        torch.cuda.synchronize()
+        ref32_outs, ref32_state = ref_program(*ins32)
+        torch.cuda.synchronize()
+    except torch.OutOfMemoryError:
+        logger.error("Reference (Pytorch) program out of memory.")
+        return None
 
     # Compute Tilelang outputs:
     dtype = ins32[0].dtype
@@ -142,11 +146,13 @@ def evaluate_outputs(cfg, kernel_outs, ref_outs, ref32_outs, verbosity: int = 1)
 
 
 def run_from_cfg(cfg: Config, inputs):
-    kernel_outs, kernel_state, ref_outs, ref_state, ref32_outs, ref32_state = compute_forward(inputs)
+    results = compute_forward(inputs)
+    if results is not None:
+        kernel_outs, kernel_state, ref_outs, ref_state, ref32_outs, ref32_state = results
 
-    evaluate_states(kernel_state, ref_state, ref32_state)
+        evaluate_states(kernel_state, ref_state, ref32_state)
 
-    evaluate_outputs(cfg, kernel_outs, ref_outs, ref32_outs)
+        evaluate_outputs(cfg, kernel_outs, ref_outs, ref32_outs)
 
     benchmark_run_times(cfg)
 
@@ -168,7 +174,7 @@ def test_single_chunk_forward():
     run_from_cfg(cfg, inputs)
 
 
-def test_multi_chunk_small_batch_forward():
+def test_multi_chunk_forward():
     cfg = Config(
         batch_size=8,
         num_heads=4,
@@ -180,47 +186,30 @@ def test_multi_chunk_small_batch_forward():
         block_T=64,
         decay_range=(5, 12),
     )
-    logger.info(f"Testing different 'dim_v' values...")
     for dim_v in [64, 128]:
+        logger.info(f"Testing 'dim_v'={dim_v}...")
         cfg.dim_v = dim_v
         inputs = generate_inputs(cfg, True)
         run_from_cfg(cfg, inputs)
     cfg.dim_v = 64
 
-    logger.info(f"Testing different 'seq_len' values...")
     for seq_len in [256, 400, 2048]:
+        logger.info(f"Testing 'seq_len'={seq_len}...")
         cfg.seq_len = seq_len
         inputs = generate_inputs(cfg, True)
         run_from_cfg(cfg, inputs)
 
     logger.info(f"Testing different 'batch_size' values...")
-    for batch_size in [1, 3, 8]:
+    for batch_size in [1, 3, 8, 64, 128, 256]:
+        logger.info(f"Testing 'batch_size'={batch_size}...")
         cfg.batch_size = batch_size
         inputs = generate_inputs(cfg, True)
         run_from_cfg(cfg, inputs)
 
 
-def test_multi_chunk_large_batch_forward():
-    cfg = Config(
-        batch_size=128,
-        num_heads=4,
-        seq_len=2048,
-        dim_qk=64,
-        dim_v=64,
-        block_K=64,
-        block_V=64,
-        block_T=64,
-        decay_range=(5, 12),
-    )
-
-    inputs = generate_inputs(cfg, False)
-    run_from_cfg(cfg, inputs)
-
-
 
 if __name__ == "__main__":
     # test_single_chunk_forward()
-    test_multi_chunk_small_batch_forward()
-    # test_multi_chunk_large_batch_forward()
+    test_multi_chunk_forward()
 
 
