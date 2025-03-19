@@ -207,9 +207,95 @@ def test_multi_chunk_forward():
         run_from_cfg(cfg, inputs)
 
 
+def test_ref_chunkwise_correctness():
+    cfg = Config(
+        batch_size=8,
+        num_heads=4,
+        seq_len=256,
+        dim_qk=64,
+        dim_v=128,
+        block_K=64,
+        block_V=64,
+        block_T=64,
+        decay_range=(5, 12),
+        dtype=torch.float32,
+    )
+    Q, K, V, S, head_decays = generate_inputs(cfg, False)
+    ref_O, ref_S_new = ref_program(Q, K, V, S, head_decays)
+    O, S_new = ref_program(Q, K, V, S, head_decays, chunk_size=128)
+
+    diff = torch.abs(O - ref_O)
+    logger.log(detail_level, f"max diff {diff.max()}, avg: {diff.mean()}, num places > 0.1: {(diff > 0.1).sum()}")
+    assert torch.allclose(S_new, ref_S_new, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(O, ref_O, rtol=1e-1, atol=1e-1)
+
+
+def test_reference_grads():
+    cfg = Config(
+        batch_size=8,
+        num_heads=4,
+        seq_len=256*2,
+        dim_qk=64,
+        dim_v=128,
+        block_K=64,
+        block_V=64,
+        block_T=64,
+        decay_range=(5, 12),
+        dtype=torch.float32,
+    )
+
+    from fused_retention import reference_grads
+    Q, K, V, S, head_decays = generate_inputs(cfg, False)
+    Q, K, V, S = Q.requires_grad_(), K.requires_grad_(), V.requires_grad_(), S.requires_grad_()
+    dO = torch.randn_like(V)
+    dS_new = torch.randn_like(S)
+
+    O, S_new = ref_program(Q, K, V, S, head_decays)
+    O.backward(dO, retain_graph=True)
+    S_new.backward(dS_new, retain_graph=True)
+
+    dQ_ref, Q.grad = Q.grad.clone(), None
+    dK_ref, K.grad = K.grad.clone(), None
+    dV_ref, V.grad = V.grad.clone(), None
+    dS_ref, S.grad = S.grad.clone(), None
+
+    dQ, dK, dV, dS = reference_grads(Q, K, V, S, head_decays, dO, dS_new)
+
+    logger.log(detail_level, f"dQ_ref: {dQ_ref.flatten()[:10]}")
+    logger.log(detail_level, f"dQ: {dQ.flatten()[:10]}")
+
+    diff = torch.abs(dQ_ref - dQ)
+    logger.log(detail_level, f"max diff: {diff.max()}, avg diff: {diff.mean()}, places with diff > 0.1: {(diff > 0.1).sum()}")
+
+    assert torch.allclose(dQ, dQ_ref, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(dK, dK_ref, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(dV, dV_ref, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(dS, dS_ref, rtol=1e-2, atol=1e-2)
+
+
+def test_utilization():
+    cfg = Config(
+        batch_size=8,
+        num_heads=4,
+        seq_len=2048,
+        dim_qk=64,
+        dim_v=128,
+        block_K=64,
+        block_V=64,
+        block_T=64,
+        decay_range=(5, 12),
+    )
+    inputs = generate_inputs(cfg, False)
+    logger.info("Testing utilization...")
+    for _ in range(10*3000):
+        fused_chunk_retention(*inputs)
+
 
 if __name__ == "__main__":
     # test_single_chunk_forward()
-    test_multi_chunk_forward()
+    # test_multi_chunk_forward()
+    test_ref_chunkwise_correctness()
+    test_reference_grads()
+    test_utilization()
 
 

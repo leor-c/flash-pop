@@ -4,7 +4,9 @@ import torch
 import tilelang
 import tilelang.language as T
 from tilelang import cached
-from einops import rearrange
+from torch import Tensor
+from einops import rearrange, einsum
+
 
 # Heavily modified https://github.com/sustcsonglin/fla-tilelang/blob/main/linear_attn/fused_chunk.py
 
@@ -244,11 +246,9 @@ def _get_decay_mask(head_decays, seq_len, device="cuda", dtype=torch.float32):
 def ref_program_(Q, K, V, prev_state, head_decays):
     qk = torch.einsum('bqhd,bkhd->bhqk', Q, K).tril()
 
-    from einops import rearrange, einsum
     device, dtype = Q.device, Q.dtype
-    f32_dtype = torch.float32
     seq_len = Q.size(1)
-    decay_mask, head_decays_ = _get_decay_mask(head_decays, seq_len, device, f32_dtype)
+    decay_mask, head_decays_ = _get_decay_mask(head_decays, seq_len, device, torch.float32)
     # decay_mask = decay_mask / decay_mask.sum(dim=-1, keepdim=True).sqrt()
 
     qkm = (qk * decay_mask.unsqueeze(0).to(dtype=dtype)).tril()
@@ -286,10 +286,9 @@ def ref_program_(Q, K, V, prev_state, head_decays):
     return o.to(dtype=dtype), state.to(dtype=dtype)
 
 
-def ref_program(Q, K, V, prev_state, head_decays, *args):
+def ref_program(Q, K, V, prev_state, head_decays, chunk_size: int = 512, *args):
     seq_len = Q.size(1)
     res = []
-    chunk_size = 512
     state_t = prev_state
     K = K / (K.size(3) ** 0.5)
     # gn = torch.nn.LayerNorm(normalized_shape=V.size(3), device=Q.device, dtype=Q.dtype)
@@ -305,3 +304,43 @@ def ref_program(Q, K, V, prev_state, head_decays, *args):
 
     return torch.cat(res, dim=1), state_t
 
+
+def reference_grads(Q: Tensor, K: Tensor, V: Tensor, prev_state: Tensor, head_decays, dO: Tensor, dS_new: Tensor, *args):
+    d_qk = K.size(3)
+    sqrt_d_qk = (d_qk ** 0.5)
+    assert d_qk == Q.size(3)
+    device, dtype = Q.device, Q.dtype
+    seq_len = Q.size(1)
+
+    D, head_decays_ = _get_decay_mask(head_decays, seq_len, device, torch.float32)
+    decay_gammas = rearrange(head_decays_, "h -> () h () ()")
+    inner_pos = rearrange(torch.arange(K.size(1), device=device, dtype=dtype) + 1, "n -> () () n ()")
+    inner_decay = rearrange(decay_gammas ** inner_pos, "b h t d -> b t h d")
+    state_decays = decay_gammas ** (K.size(1) - inner_pos)
+    chunk_decay = decay_gammas ** K.size(1)
+
+    # dQ = ((dO @ V.T) * (D / (d_qk ** 0.5))) @ K + (dO * inner_decay) @ prev_state.T
+    dO_VT_D = einsum(dO, V, "b t1 h dv, b t2 h dv -> b h t1 t2") / sqrt_d_qk
+    dO_VT_D = einsum(dO_VT_D, D, "b h t1 t2, h t1 t2 -> b h t1 t2")
+    dQ1 = einsum(dO_VT_D, K, "b h t1 t2, b t2 h dk -> b t1 h dk")
+
+    dQ2 = einsum(dO * inner_decay, prev_state, "b t h dv, b h dk dv -> b t h dk")
+
+    dQ = dQ1 + dQ2
+
+    # Compute dK:
+    dK = (
+        einsum(dO_VT_D, Q, "b h t1 t2, b t1 h dk -> b t2 h dk") +
+        einsum(V, dS_new, state_decays, "b t h dv, b h dk dv, b h t dk -> b t h dk") / sqrt_d_qk
+    )
+
+    A = einsum(Q, K, D, "b t1 h dk, b t2 h dk, h t1 t2 -> b h t1 t2") / sqrt_d_qk
+    dV = (
+        einsum(A, dO, "b h t1 t2, b t1 h dv -> b t2 h dv") + einsum(K / sqrt_d_qk, state_decays, dS_new, "b t h dk, b h t dk, b h dk dv -> b t h dv")
+    )
+
+    dS = (
+        einsum(Q, inner_decay * dO, "b t h dk, b t h dv -> b h dk dv") + chunk_decay * dS_new
+    )
+
+    return dQ, dK, dV, dS
