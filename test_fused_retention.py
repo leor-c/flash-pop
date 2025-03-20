@@ -92,10 +92,8 @@ def compute_forward(inputs: list):
     dtype = ins32[0].dtype
     lib_outs, lib_state = fused_chunk_retention(*inputs)
     torch.cuda.synchronize()
-    lib_outs = lib_outs.float().sum(0).to(dtype=dtype)
     # gn = torch.nn.LayerNorm(normalized_shape=dim_v, device="cuda", dtype=io_dtype)
     # lib_outs = gn(lib_outs)
-    lib_state = lib_state.float().sum(0).to(dtype=dtype)
 
     return lib_outs, lib_state, ref_outs, ref_state, ref32_outs, ref32_state
 
@@ -273,6 +271,56 @@ def test_reference_grads():
     assert torch.allclose(dS, dS_ref, rtol=1e-2, atol=1e-2)
 
 
+def test_backward_pass():
+    cfg = Config(
+        batch_size=8,
+        num_heads=4,
+        seq_len=256 * 2,
+        dim_qk=64,
+        dim_v=128,
+        block_K=64,
+        block_V=64,
+        block_T=64,
+        decay_range=(5, 12),
+    )
+
+    Q, K, V, S, head_decays = generate_inputs(cfg, False)
+    Q, K, V, S = Q.requires_grad_(), K.requires_grad_(), V.requires_grad_(), S.requires_grad_()
+    dO = torch.randn_like(V)
+    dS_new = torch.randn_like(S)
+
+    O, S_new = ref_program(Q, K, V, S, head_decays)
+    O.backward(dO, retain_graph=True)
+    S_new.backward(dS_new, retain_graph=True)
+
+    dQ_ref, Q.grad = Q.grad.clone(), None
+    dK_ref, K.grad = K.grad.clone(), None
+    dV_ref, V.grad = V.grad.clone(), None
+    dS_ref, S.grad = S.grad.clone(), None
+
+
+    O, S_new = fused_chunk_retention(Q, K, V, S, head_decays)
+    O.backward(dO, retain_graph=True)
+    S_new.backward(dS_new, retain_graph=True)
+
+    dQ, Q.grad = Q.grad.clone(), None
+    dK, K.grad = K.grad.clone(), None
+    dV, V.grad = V.grad.clone(), None
+    dS, S.grad = S.grad.clone(), None
+
+    logger.log(detail_level, f"dQ_ref: {dQ_ref.flatten()[:10]}")
+    logger.log(detail_level, f"dQ: {dQ.flatten()[:10]}")
+
+    diff = torch.abs(dQ_ref - dQ)
+    logger.log(detail_level,
+               f"max diff: {diff.max()}, avg diff: {diff.mean()}, places with diff > 0.1: {(diff > 0.1).sum()}")
+
+    assert torch.allclose(dQ, dQ_ref, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(dK, dK_ref, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(dV, dV_ref, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(dS, dS_ref, rtol=1e-2, atol=1e-2)
+
+
 def test_utilization():
     cfg = Config(
         batch_size=8,
@@ -296,6 +344,7 @@ if __name__ == "__main__":
     # test_multi_chunk_forward()
     test_ref_chunkwise_correctness()
     test_reference_grads()
-    test_utilization()
+    test_backward_pass()
+    # test_utilization()
 
 
