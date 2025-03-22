@@ -13,7 +13,7 @@ from test_fused_retention import Config as RetNetConfig, generate_inputs, get_er
 def ref_pop(Q, K, V, prev_state, head_decays, block_size: int = 512, *args):
     seq_len = Q.size(1)
     res = []
-    states = [prev_state]
+    states = []
     state_t = prev_state
     K = K / (K.size(3) ** 0.5)
     # gn = torch.nn.LayerNorm(normalized_shape=V.size(3), device=Q.device, dtype=Q.dtype)
@@ -32,20 +32,7 @@ def ref_pop(Q, K, V, prev_state, head_decays, block_size: int = 512, *args):
     return torch.cat(res, dim=1), torch.stack(states, dim=1)
 
 
-def test_correctness():
-    cfg = RetNetConfig(
-        batch_size=128,
-        num_heads=4,
-        seq_len=287,
-        dim_qk=64,
-        dim_v=128,
-        block_K=64,
-        block_V=64,
-        block_T=64,
-        decay_range=(5, 12),
-    )
-    block_size = 144
-
+def run_test(cfg, block_size):
     Q, K, V, S, head_decays = generate_inputs(cfg, False)
 
     O_ref, states_ref = ref_pop(Q, K, V, S, head_decays, block_size=block_size)
@@ -61,15 +48,104 @@ def test_correctness():
     err_ratio = get_err_ratio(states, states_ref)
     print(f"Err ratio: {err_ratio}, Mean states diff: {s_diff.mean()}, max states diff: {s_diff.max()}")
 
-    print(f"{states[0, 1, 0]}")
-    print(f"{states_ref[0, 1, 0]}")
+    print(f"{states[0, 0, 0]}")
+    print(f"{states_ref[0, 0, 0]}")
 
     from fused_retention import fused_chunk_retention
     latency = do_bench(partial(fused_pop_retention, Q, K, V, S, head_decays, block_size))
-    logger.info("Ref: {:.2f} ms".format(latency))
+    logger.info("POP: {:.2f} ms".format(latency))
     latency = do_bench(partial(fused_chunk_retention, Q, K, V, S, head_decays))
-    logger.info("tilelang: {:.2f} ms".format(latency))
+    logger.info("RetNet: {:.2f} ms".format(latency))
+
+
+def test_generation_scenario():
+    """
+    Test the scenario where the input is composed of 1 full (obs-action) block, followed by a suffix of pred tokens.
+    We want to output only the state at the end of the real block, and exclude the suffix from the state.
+    Returns:
+
+    """
+    cfg = RetNetConfig(
+        batch_size=128,
+        num_heads=4,
+        seq_len=287,
+        dim_qk=64,
+        dim_v=128,
+        block_K=64,
+        block_V=64,
+        block_T=64,
+        decay_range=(5, 12),
+    )
+    block_size = 144
+
+    run_test(cfg, block_size)
+
+    cfg = RetNetConfig(
+        batch_size=128,
+        num_heads=4,
+        seq_len=28,
+        dim_qk=64,
+        dim_v=128,
+        block_K=64,
+        block_V=64,
+        block_T=64,
+        decay_range=(5, 12),
+    )
+    block_size = 15
+
+    run_test(cfg, block_size)
+
+
+def test_training_scenario():
+    """
+    Test the scenario where the input is composed of 1 full (obs-action) block, followed by a suffix of pred tokens.
+    We want to output only the state at the end of the real block, and exclude the suffix from the state.
+    Returns:
+
+    """
+    block_size = 144
+    cfg = RetNetConfig(
+        batch_size=8,
+        num_heads=4,
+        seq_len=block_size*20,
+        dim_qk=64,
+        dim_v=128,
+        block_K=64,
+        block_V=64,
+        block_T=64,
+        decay_range=(5, 12),
+    )
+    run_test(cfg, block_size)
+
+    block_size = 32
+    cfg = RetNetConfig(
+        batch_size=8,
+        num_heads=4,
+        seq_len=block_size * 20,
+        dim_qk=64,
+        dim_v=128,
+        block_K=64,
+        block_V=64,
+        block_T=64,
+        decay_range=(5, 12),
+    )
+    run_test(cfg, block_size)
+
+    block_size = 15
+    cfg = RetNetConfig(
+        batch_size=8,
+        num_heads=4,
+        seq_len=block_size*20,
+        dim_qk=64,
+        dim_v=128,
+        block_K=64,
+        block_V=64,
+        block_T=64,
+        decay_range=(5, 12),
+    )
+    run_test(cfg, block_size)
 
 
 if __name__ == '__main__':
-    test_correctness()
+    test_generation_scenario()
+    test_training_scenario()

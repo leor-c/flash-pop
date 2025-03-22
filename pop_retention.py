@@ -12,7 +12,7 @@ def fused_pop_retention_fwd(batch, heads, seq_len, block_size, dim_qk, dim_v, BK
     v_shape = [batch, seq_len, heads, dim_v]
     o_shape = [NK, batch, seq_len, heads, dim_v]  # we have to reduce the first dimension
     state_shape = [batch, heads, dim_qk, dim_v]
-    block_states_shape = [NK, batch, num_full_blocks+1, heads, dim_qk, dim_v]
+    block_states_shape = [NK, batch, num_full_blocks, heads, dim_qk, dim_v]
     dtype = "bfloat16"
     accum_dtype = "float"
 
@@ -39,8 +39,9 @@ def fused_pop_retention_fwd(batch, heads, seq_len, block_size, dim_qk, dim_v, BK
             state:
             chunk_decays_mask:
             Output:
-            block_states: states at the end of complete blocks, incl. initial state. For example, for sequence
-            of length 40 with blocks of 15 tokens, this will include states (index): initial state, 14, and 29.
+            block_states: states at the end of complete blocks. For example, for sequence
+            of length 40 with blocks of 15 tokens, this will include states that summarized all tokens
+            up to and including index: 14 and 29.
 
         Returns:
 
@@ -64,13 +65,11 @@ def fused_pop_retention_fwd(batch, heads, seq_len, block_size, dim_qk, dim_v, BK
             segment_state_local = T.alloc_fragment((BK, BV), accum_dtype)
 
             state_shared = T.alloc_fragment((BK, BV), dtype, scope="shared")
-            segment_state_shared = T.alloc_shared((BK, BV), dtype)
 
             T.annotate_layout({
                 Q_shared: tilelang.layout.make_swizzled_layout(Q_shared),
                 output_shared: tilelang.layout.make_swizzled_layout(output_shared),
                 state_shared: tilelang.layout.make_swizzled_layout(state_shared),
-                segment_state_shared: tilelang.layout.make_swizzled_layout(segment_state_shared),
             })
 
             T.clear(state_local)
@@ -106,14 +105,14 @@ def fused_pop_retention_fwd(batch, heads, seq_len, block_size, dim_qk, dim_v, BK
                 # determine how many blocks start within the current chunk:
                 first_token_block = T.FloorDiv(k * BT, block_size)
                 last_token_block = T.FloorDiv((k+1) * BT - 1, block_size)
-                is_first_token_block_start = T.if_then_else(T.Mod(k * BT, block_size) > 0, 0, 1)
-                num_iterations = last_token_block - first_token_block + is_first_token_block_start
-                block_idx = first_token_block + 1 - is_first_token_block_start
-                block_start_idx = block_idx * block_size - k * BT
+                is_last_token_block_end = T.if_then_else(T.Mod((k+1) * BT, block_size) == 0, 1, 0)
+                num_iterations = last_token_block - first_token_block + is_last_token_block_end
+                block_idx = first_token_block
+                next_block_start_idx = (block_idx+1) * block_size - k * BT
 
                 for i_block in T.Pipelined(num_iterations, num_stages=0):
                     T.copy(state_shared, segment_state_local)
-                    c = BT - (block_start_idx + i_block * block_size)
+                    c = BT - (next_block_start_idx + i_block * block_size)
                     update_recurrent_state(
                         mask,
                         K_shared,
