@@ -11,13 +11,9 @@ from einops import rearrange, einsum
 # Heavily modified https://github.com/sustcsonglin/fla-tilelang/blob/main/linear_attn/fused_chunk.py
 
 
-def fused_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
+def chunk_outputs_macro(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
     NK = T.ceildiv(dim_qk, BK)
-    qk_shape = [batch, seq_len, heads, dim_qk]
-    v_shape = [batch, seq_len, heads, dim_v]
     o_shape = [NK, batch, seq_len, heads, dim_v]  # we have to reduce the first dimension
-    state_shape = [batch, heads, dim_qk, dim_v]
-    out_state_shape = [NK, batch, heads, dim_qk, dim_v]
     dtype = "bfloat16"
     accum_dtype = "float"
 
@@ -25,12 +21,12 @@ def fused_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
 
     @T.macro
     def compute_retention_chunk_outputs(
-            acc_A_local: T.Buffer([BT, BT], accum_dtype),
-            acc_A_cast: T.Buffer([BT, BT], dtype),
+            attention_scores_local: T.Buffer([BT, BT], accum_dtype),
+            attention_scores_cast: T.Buffer([BT, BT], dtype),
             mask: T.Buffer([BT, BT], accum_dtype),
-            acc_s_shared: T.Buffer([BK, BV], dtype),
-            acc_o_shared: T.Buffer([BT, BV], dtype),
-            acc_o_local: T.Buffer([BT, BV], accum_dtype),
+            state_shared: T.Buffer([BK, BV], dtype),
+            output_shared: T.Buffer([BT, BV], dtype),
+            output_local: T.Buffer([BT, BV], accum_dtype),
             Q_shared: T.Buffer([BT, BK], dtype),
             K_shared: T.Buffer([BT, BK], dtype),
             V_shared: T.Buffer([BT, BV], dtype),
@@ -43,23 +39,32 @@ def fused_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
             k: T.int32
     ):
         # Compute chunk attention scores (within chunk):
-        T.clear(acc_A_local)
-        T.gemm(Q_shared, K_shared, acc_A_local, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
+        T.clear(attention_scores_local)
+        T.gemm(Q_shared, K_shared, attention_scores_local, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
         for i, j in T.Parallel(BT, BT):
-            acc_A_local[i, j] = (acc_A_local[i, j] / sqrt_dim_qk) * mask[i, j]
-            # acc_A_local[i, j] = T.if_then_else(i >= j, acc_A_local[i, j] * T.pow(decay, i - j), 0)
-        T.copy(acc_A_local, acc_A_cast)
+            attention_scores_local[i, j] = (attention_scores_local[i, j] / sqrt_dim_qk) * mask[i, j]
+            # attention_scores_local[i, j] = T.if_then_else(i >= j, attention_scores_local[i, j] * T.pow(decay, i - j), 0)
+        T.copy(attention_scores_local, attention_scores_cast)
 
         # Compute outputs:
-        T.clear(acc_o_local)
-        T.gemm(Q_shared, acc_s_shared, acc_o_local, policy=T.GemmWarpPolicy.FullCol)
+        T.clear(output_local)
+        T.gemm(Q_shared, state_shared, output_local, policy=T.GemmWarpPolicy.FullCol)
         for i, j in T.Parallel(BT, BV):
-            acc_o_local[i, j] = acc_o_local[i, j] * (mask[i, 0] * decay)
+            output_local[i, j] = output_local[i, j] * (mask[i, 0] * decay)
 
-        T.gemm(acc_A_cast, V_shared, acc_o_local, policy=T.GemmWarpPolicy.FullCol)
+        T.gemm(attention_scores_cast, V_shared, output_local, policy=T.GemmWarpPolicy.FullCol)
 
-        T.copy(acc_o_local, acc_o_shared)
-        T.copy(acc_o_shared, Output[i_bk, i_batch, k * BT:(k + 1) * BT, i_head, i_bv * BV:(i_bv + 1) * BV])
+        T.copy(output_local, output_shared)
+        T.copy(output_shared, Output[i_bk, i_batch, k * BT:(k + 1) * BT, i_head, i_bv * BV:(i_bv + 1) * BV])
+
+    return compute_retention_chunk_outputs
+
+
+def chunk_state_update_macro(dim_qk, BK, BV, BT):
+    dtype = "bfloat16"
+    accum_dtype = "float"
+
+    sqrt_dim_qk = dim_qk ** 0.5
 
     @T.macro
     def update_recurrent_state(
@@ -68,8 +73,8 @@ def fused_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
             K_local_trans: T.Buffer([BK, BT], accum_dtype),
             K_local_trans_cast: T.Buffer([BK, BT], dtype),
             V_shared: T.Buffer([BT, BV], dtype),
-            acc_s_local: T.Buffer([BK, BV], accum_dtype),
-            acc_s_shared: T.Buffer([BK, BV], dtype),
+            state_local: T.Buffer([BK, BV], accum_dtype),
+            state_shared: T.Buffer([BK, BV], dtype),
             decay: T.float32,
             effective_chunk_size_correction: T.int32
     ):
@@ -77,14 +82,34 @@ def fused_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
         c = effective_chunk_size_correction  # if last chunk is shorter (c>0), decays exponents should be adjusted
         for i, j in T.Parallel(BK, BT):
             # Also apply decay terms:
-            K_local_trans[i, j] = (K_shared[j, i] / sqrt_dim_qk) * mask[BT-1, j+c]  # T.pow(decay, BT - j - 1)
+            mask_clipped = T.if_then_else(j+c <= BT-1, mask[BT - 1, j+c], 0)
+            K_local_trans[i, j] = (K_shared[j, i] / sqrt_dim_qk) * mask_clipped  # T.pow(decay, BT - j - 1)
         T.copy(K_local_trans, K_local_trans_cast)
 
-        cross_chunk_decay = mask[BT - 1, c] * decay  # T.pow(decay, BT)
+        # cross_chunk_decay = T.if_then_else(effective_chunk_size_correction < BT, mask[BT - 1, c] * decay, 1)  # T.pow(decay, BT)
+        cross_chunk_decay = T.if_then_else(c < BT, mask[BT - 1, c] * decay, mask[0, 0])  # mask[0, 0] = 1
         for i, j in T.Parallel(BK, BV):
-            acc_s_local[i, j] = acc_s_local[i, j] * cross_chunk_decay
-        T.gemm(K_local_trans_cast, V_shared, acc_s_local, policy=T.GemmWarpPolicy.FullCol)
-        T.copy(acc_s_local, acc_s_shared)
+            state_local[i, j] = state_local[i, j] * cross_chunk_decay
+        T.gemm(K_local_trans_cast, V_shared, state_local, policy=T.GemmWarpPolicy.FullCol)
+        T.copy(state_local, state_shared)
+
+    return update_recurrent_state
+
+
+
+def fused_chunk_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
+    NK = T.ceildiv(dim_qk, BK)
+    qk_shape = [batch, seq_len, heads, dim_qk]
+    v_shape = [batch, seq_len, heads, dim_v]
+    o_shape = [NK, batch, seq_len, heads, dim_v]  # we have to reduce the first dimension
+    state_shape = [batch, heads, dim_qk, dim_v]
+    out_state_shape = [NK, batch, heads, dim_qk, dim_v]
+    dtype = "bfloat16"
+    accum_dtype = "float"
+
+    compute_retention_chunk_outputs = chunk_outputs_macro(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT)
+
+    update_recurrent_state = chunk_state_update_macro(dim_qk, BK, BV, BT)
 
     @T.prim_func
     def main(
@@ -92,8 +117,7 @@ def fused_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
             K: T.Buffer(qk_shape, dtype),
             V: T.Buffer(v_shape, dtype),
             state: T.Buffer(state_shape, dtype),
-            head_decays: T.Buffer([heads], accum_dtype),
-            decays_block: T.Buffer([heads, BT, BT], accum_dtype),
+            chunk_decays_mask: T.Buffer([heads, BT, BT], accum_dtype),
             Output: T.Buffer(o_shape, dtype),
             out_state: T.Buffer(out_state_shape, dtype),
     ):
@@ -106,35 +130,29 @@ def fused_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
             K_local_trans_cast = T.alloc_fragment([BK, BT], dtype)
             V_shared = T.alloc_shared([BT, BV], dtype)
 
-            acc_o_local = T.alloc_fragment((BT, BV), accum_dtype)
-            acc_o_shared = T.alloc_shared([BT, BV], dtype)
+            output_local = T.alloc_fragment((BT, BV), accum_dtype)
+            output_shared = T.alloc_shared([BT, BV], dtype)
 
-            acc_s_local = T.alloc_fragment((BK, BV), accum_dtype)
-            acc_A_local = T.alloc_fragment((BT, BT), accum_dtype)
-            acc_A_cast = T.alloc_shared((BT, BT), dtype)
+            state_local = T.alloc_fragment((BK, BV), accum_dtype)
+            attention_scores_local = T.alloc_fragment((BT, BT), accum_dtype)
+            attention_scores_cast = T.alloc_shared((BT, BT), dtype)
             mask = T.alloc_shared((BT, BT), accum_dtype)
 
-            acc_s_shared = T.alloc_fragment((BK, BV), dtype, scope="shared")
-
-            decays_shared = T.alloc_shared((heads,), accum_dtype)
+            state_shared = T.alloc_fragment((BK, BV), dtype, scope="shared")
 
             T.annotate_layout({
                 Q_shared: tilelang.layout.make_swizzled_layout(Q_shared),
-                acc_o_shared: tilelang.layout.make_swizzled_layout(acc_o_shared),
-                acc_s_shared: tilelang.layout.make_swizzled_layout(acc_s_shared),
+                output_shared: tilelang.layout.make_swizzled_layout(output_shared),
+                state_shared: tilelang.layout.make_swizzled_layout(state_shared),
             })
 
-            T.clear(acc_s_local)
-            T.copy(state[i_batch, i_head, i_bk * BK:(i_bk + 1) * BK, i_bv * BV:(i_bv + 1) * BV], acc_s_shared)
-            T.copy(acc_s_shared, acc_s_local)
+            T.clear(state_local)
+            T.copy(state[i_batch, i_head, i_bk * BK:(i_bk + 1) * BK, i_bv * BV:(i_bv + 1) * BV], state_shared)
+            T.copy(state_shared, state_local)
 
             # init decay values:
-            T.copy(head_decays[:heads], decays_shared)
-            decay = decays_shared[i_head]
-
-            T.copy(decays_block[i_head, :, :], mask)
-            # for i, j in T.Parallel(BT, BT):
-            #     mask_local[i, j] = T.if_then_else(i >= j, T.pow(decay, i-j), 0)
+            T.copy(chunk_decays_mask[i_head, :, :], mask)
+            decay = mask[1, 0]
 
             loop_range = T.ceildiv(seq_len, BT)
             for k in T.Pipelined(loop_range, num_stages=2):
@@ -144,12 +162,12 @@ def fused_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
                 effective_chunk_size_correction = T.max(0, ((k+1)*BT) - seq_len)
 
                 compute_retention_chunk_outputs(
-                    acc_A_local,
-                    acc_A_cast,
+                    attention_scores_local,
+                    attention_scores_cast,
                     mask,
-                    acc_s_shared,
-                    acc_o_shared,
-                    acc_o_local,
+                    state_shared,
+                    output_shared,
+                    output_local,
                     Q_shared,
                     K_shared,
                     V_shared,
@@ -164,17 +182,17 @@ def fused_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
                     K_local_trans,
                     K_local_trans_cast,
                     V_shared,
-                    acc_s_local,
-                    acc_s_shared,
+                    state_local,
+                    state_shared,
                     decay,
                     effective_chunk_size_correction
                 )
-            T.copy(acc_s_shared, out_state[i_bk, i_batch, i_head, i_bk * BK:(i_bk + 1) * BK, i_bv * BV:(i_bv + 1) * BV])
+            T.copy(state_shared, out_state[i_bk, i_batch, i_head, i_bk * BK:(i_bk + 1) * BK, i_bv * BV:(i_bv + 1) * BV])
 
     return main
 
 
-def fused_retention_bwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
+def fused_retention_bwd_dk_dv_ds(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
     NK = T.ceildiv(dim_qk, BK)
     qk_shape = [batch, seq_len, heads, dim_qk]
     v_shape = [batch, seq_len, heads, dim_v]
@@ -192,12 +210,9 @@ def fused_retention_bwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
             Q: T.Buffer(qk_shape, dtype),
             K: T.Buffer(qk_shape, dtype),
             V: T.Buffer(v_shape, dtype),
-            # state: T.Buffer(state_shape, dtype),
-            # head_decays: T.Buffer([heads], accum_dtype),
-            decays_block: T.Buffer([heads, BT, BT], accum_dtype),
+            chunk_decays_mask: T.Buffer([heads, BT, BT], accum_dtype),
             dO: T.Buffer(v_shape, dtype),
             dS_new: T.Buffer(state_shape, dtype),
-            # dQ: T.Buffer(dqk_shape, dtype),
             dK: T.Buffer(dqk_shape, dtype),
             dV: T.Buffer(dv_shape, dtype),
             dS: T.Buffer(d_state_shape, dtype),
@@ -207,18 +222,12 @@ def fused_retention_bwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
             K_shared = T.alloc_shared([BT, BK], dtype)
             BK_BT_cast = T.alloc_fragment([BK, BT], dtype)
             V_shared = T.alloc_shared([BT, BV], dtype)
-            # s_shared = T.alloc_shared([BK, BV], dtype)
 
             dO_shared = T.alloc_shared([BT, BV], dtype)
             BT_BV_shared = T.alloc_shared([BT, BV], dtype)
             dS_new_shared = T.alloc_shared([BK, BV], dtype)
 
-            # dQ_shared = T.alloc_shared([BT, BK], dtype)
-            # dK_shared = T.alloc_shared([BT, BK], dtype)
-            # dV_shared = T.alloc_shared([BT, BV], dtype)
-
             mask = T.alloc_shared((BT, BT), accum_dtype)
-            # decays_shared = T.alloc_shared((heads,), accum_dtype)
 
             BT_BT_buffer = T.alloc_fragment((BT, BT), accum_dtype)
             BT_BT_buffer2 = T.alloc_fragment((BT, BT), accum_dtype)
@@ -235,16 +244,13 @@ def fused_retention_bwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
             #     Q_shared: tilelang.layout.make_swizzled_layout(Q_shared),
             #     dO_shared: tilelang.layout.make_swizzled_layout(dO_shared),
             #     dS_new_shared: tilelang.layout.make_swizzled_layout(dS_new_shared),
-            #     # s_shared: tilelang.layout.make_swizzled_layout(s_shared),
             # })
 
             i_bk = bz % NK
             i_bv = bz // NK
 
             # prepare:
-            T.copy(decays_block[i_head, :, :], mask)
-            # T.copy(head_decays[:heads], decays_shared)
-            # decay = decays_shared[i_head]
+            T.copy(chunk_decays_mask[i_head, :, :], mask)
             decay = mask[1, 0]
 
             T.copy(dS_new[i_batch, i_head, i_bk * BK:(i_bk + 1) * BK, i_bv * BV:(i_bv + 1) * BV], dS_new_shared)
@@ -266,10 +272,6 @@ def fused_retention_bwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
                 for i, j in T.Parallel(BT, BT):
                     BT_BT_buffer[i, j] = BT_BT_buffer[i, j] * mask[i, j] / sqrt_dim_qk
                 T.copy(BT_BT_buffer, BT_BT_cast)
-                # T.clear(BT_BK_buffer)
-                # T.gemm(BT_BT_cast, K_shared, BT_BK_buffer, policy=T.GemmWarpPolicy.FullCol)
-                # T.copy(BT_BK_buffer, dQ_shared)
-                # T.copy(BT_BK_buffer, dQ[i_bk, i_batch, k * BT:(k + 1) * BT, i_head, i_bk * BK:(i_bk + 1) * BK])
 
                 # Compute dK:
                 T.clear(BT_BK_buffer)
@@ -326,42 +328,10 @@ def fused_retention_bwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
                 T.copy(dS_local, dS_new_shared)
             T.copy(dS_new_shared, dS[i_bk, i_batch, i_head, i_bk * BK:(i_bk + 1) * BK, i_bv * BV:(i_bv + 1) * BV])
 
-            # T.copy(state[i_batch, i_head, i_bk * BK:(i_bk + 1) * BK, i_bv * BV:(i_bv + 1) * BV], s_shared)
-            # for k in T.Pipelined(loop_range, num_stages=2):
-            #     # Compute the second term of dQ that depends on the prev state, which must be computed
-            #     # and accumulated from start to end:
-            #     T.copy(dO[i_batch, k * BT:(k + 1) * BT, i_head, i_bv * BV:(i_bv + 1) * BV], dO_shared)
-            #     T.copy(dO_shared, BT_BV_buffer)
-            #     for i, j in T.Parallel(BT, BV):
-            #         BT_BV_buffer[i, j] = BT_BV_buffer[i, j] * (mask[i, 0] * decay)
-            #     T.copy(BT_BV_buffer, BT_BV_shared)
-            #
-            #     T.copy(dQ[i_bk, i_batch, k * BT:(k + 1) * BT, i_head, i_bk * BK:(i_bk + 1) * BK], BT_BK_cast)
-            #     T.copy(BT_BK_cast, BT_BK_buffer)
-            #     T.gemm(BT_BV_shared, s_shared, BT_BK_buffer, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
-            #     T.copy(BT_BK_buffer, dQ[i_bk, i_batch, k * BT:(k + 1) * BT, i_head, i_bk * BK:(i_bk + 1) * BK])
-            #
-            #     # update the state:
-            #     c = T.max(0, ((k + 1) * BT) - seq_len)
-            #     T.copy(K[i_batch, k * BT:(k + 1) * BT, i_head, i_bk * BK:(i_bk + 1) * BK], K_shared)
-            #     T.copy(V[i_batch, k * BT:(k + 1) * BT, i_head, i_bv * BV:(i_bv + 1) * BV], V_shared)
-            #
-            #     for i, j in T.Parallel(BK, BT):
-            #         # Also apply decay terms:
-            #         BT_BK_buffer[j, i] = (K_shared[j, i] / sqrt_dim_qk) * mask[BT - 1, j + c]  # T.pow(decay, BT - j - 1)
-            #         BK_BT_cast[i, j] = BT_BK_buffer[j, i]
-            #
-            #     cross_chunk_decay = mask[BT - 1, c] * decay  # T.pow(decay, BT)
-            #     T.copy(s_shared, dS_local)
-            #     for i, j in T.Parallel(BK, BV):
-            #         dS_local[i, j] = dS_local[i, j] * cross_chunk_decay
-            #     T.gemm(BK_BT_cast, V_shared, dS_local, policy=T.GemmWarpPolicy.FullCol)
-            #     T.copy(dS_local, s_shared)
-
     return main
 
 
-def fused_retention_bwd_dQ(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
+def fused_retention_bwd_dq(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
     NK = T.ceildiv(dim_qk, BK)
     qk_shape = [batch, seq_len, heads, dim_qk]
     v_shape = [batch, seq_len, heads, dim_v]
@@ -377,7 +347,7 @@ def fused_retention_bwd_dQ(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
             K: T.Buffer(qk_shape, dtype),
             V: T.Buffer(v_shape, dtype),
             state: T.Buffer(state_shape, dtype),
-            decays_block: T.Buffer([heads, BT, BT], accum_dtype),
+            chunk_decays_mask: T.Buffer([heads, BT, BT], accum_dtype),
             dO: T.Buffer(v_shape, dtype),
             dQ: T.Buffer(dqk_shape, dtype),
     ):
@@ -407,9 +377,7 @@ def fused_retention_bwd_dQ(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
             i_bv = bz // NK
 
             # prepare:
-            T.copy(decays_block[i_head, :, :], mask)
-            # T.copy(head_decays[:heads], decays_shared)
-            # decay = decays_shared[i_head]
+            T.copy(chunk_decays_mask[i_head, :, :], mask)
             decay = mask[1, 0]
 
             T.copy(state[i_batch, i_head, i_bk * BK:(i_bk + 1) * BK, i_bv * BV:(i_bv + 1) * BV], s_shared)
@@ -466,26 +434,24 @@ class FusedChunkRetention(torch.autograd.Function):
         block_K, block_V, block_T = 64, 64, 64
 
         assert len(head_decays) == num_heads
-        chunk_decays, head_decays_ = _get_decay_mask(head_decays, block_T)
+        chunk_decays = _get_decay_mask(head_decays, block_T)
 
-        mod = tilelang.cached(fused_retention_fwd, [6, 7], batch_size, num_heads, seq_len, dim_qk, dim_v, block_K, block_V, block_T)
-        o, s_new = mod(q, k, v, s, head_decays_, chunk_decays)
-        ctx.save_for_backward(q, k, v, s, head_decays_, chunk_decays)
+        mod = tilelang.cached(fused_chunk_retention_fwd, [5, 6], batch_size, num_heads, seq_len, dim_qk, dim_v, block_K, block_V, block_T)
+        o, s_new = mod(q, k, v, s, chunk_decays)
+        ctx.save_for_backward(q, k, v, s, chunk_decays)
         return o.sum(0), s_new.sum(0)
 
     @staticmethod
     def backward(ctx, dO, dS_new):
-        q, k, v, s, head_decays_, chunk_decays = ctx.saved_tensors
+        q, k, v, s, chunk_decays = ctx.saved_tensors
 
         batch_size, seq_len, num_heads, dim_qk = q.shape
         dim_v = v.shape[-1]
         block_K, block_V, block_T = 64, 64, 64
 
-        # mod = tilelang.cached(fused_retention_bwd, [8, 9, 10, 11], batch_size, num_heads, seq_len, dim_qk, dim_v, block_K, block_V, block_T)
-        mod = tilelang.cached(fused_retention_bwd, [6, 7, 8], batch_size, num_heads, seq_len, dim_qk, dim_v, block_K, block_V, block_T)
-        # _, dK, dV, dS = mod(q, k, v, s, head_decays_, chunk_decays, dO, dS_new)
+        mod = tilelang.cached(fused_retention_bwd_dk_dv_ds, [6, 7, 8], batch_size, num_heads, seq_len, dim_qk, dim_v, block_K, block_V, block_T)
         dK, dV, dS = mod(q, k, v, chunk_decays, dO, dS_new)
-        mod2 = tilelang.cached(fused_retention_bwd_dQ, [5], batch_size, num_heads, seq_len, dim_qk, dim_v, block_K, block_V, block_T)
+        mod2 = tilelang.cached(fused_retention_bwd_dq, [5], batch_size, num_heads, seq_len, dim_qk, dim_v, block_K, block_V, block_T)
         dQ = mod2(k, v, s, chunk_decays, dO)
 
         return dQ.sum(0), dK.sum(0), dV.sum(0), dS.sum(0), None
@@ -514,27 +480,36 @@ fused_chunk_retention = FusedChunkRetention.apply
 cached_masks = {}
 cached_head_decays = {}
 
-def _get_decay_mask(head_decays, seq_len, device="cuda", dtype=torch.float32):
+def _get_decay_mask(head_decays, seq_len, device="cuda", dtype=torch.float32, return_head_decays: bool = False):
+    head_decays = tuple(head_decays)
     key = tuple([seq_len, *head_decays])
     global cached_mask
     if key in cached_masks:
-        return cached_masks[key], cached_head_decays[key]
+        if return_head_decays:
+            return cached_masks[key], cached_head_decays[head_decays]
+        return cached_masks[key]
 
-    head_decays = torch.tensor(head_decays, device=device, dtype=dtype)
-    cached_head_decays[key] = head_decays
+    if head_decays in cached_head_decays:
+        head_decays_t = cached_head_decays[head_decays]
+    else:
+        head_decays_t = torch.tensor(head_decays, device=device, dtype=dtype)
+        cached_head_decays[head_decays] = head_decays_t
 
     query_pos = torch.arange(seq_len, device=device, dtype=dtype).unsqueeze_(-1)
     key_pos = torch.arange(seq_len, device=device, dtype=dtype).unsqueeze_(0)
     distance = query_pos - key_pos
 
     distance = rearrange(distance, "n s -> () n s")
-    decay_gammas = rearrange(head_decays, "h -> h () ()")
+    decay_gammas = rearrange(head_decays_t, "h -> h () ()")
     decay_mask = decay_gammas ** distance
     decay_mask = decay_mask.tril()
 
     cached_masks[key] = decay_mask
 
-    return decay_mask, head_decays
+    if return_head_decays:
+        return decay_mask, head_decays_t
+
+    return decay_mask
 
 
 def ref_program_(Q, K, V, prev_state, head_decays):
@@ -542,7 +517,7 @@ def ref_program_(Q, K, V, prev_state, head_decays):
 
     device, dtype = Q.device, Q.dtype
     seq_len = Q.size(1)
-    decay_mask, head_decays_ = _get_decay_mask(head_decays, seq_len, device, torch.float32)
+    decay_mask, head_decays_ = _get_decay_mask(head_decays, seq_len, device, torch.float32, return_head_decays=True)
     # decay_mask = decay_mask / decay_mask.sum(dim=-1, keepdim=True).sqrt()
 
     qkm = (qk * decay_mask.unsqueeze(0).to(dtype=dtype)).tril()
