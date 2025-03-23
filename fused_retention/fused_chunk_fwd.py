@@ -51,7 +51,7 @@ def chunk_outputs_macro(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
     return compute_retention_chunk_outputs
 
 
-def chunk_state_update_macro(dim_qk, BK, BV, BT):
+def chunk_state_update_macro(dim_qk, BK, BV, BT, copy_state_from_shared_to_local: bool = False):
     dtype = "bfloat16"
     accum_dtype = "float"
 
@@ -75,10 +75,12 @@ def chunk_state_update_macro(dim_qk, BK, BV, BT):
             # Also apply decay terms:
             mask_clipped = T.if_then_else(j+c <= BT-1, mask[BT - 1, j+c], 0)
             K_local_trans[i, j] = (K_shared[j, i] / sqrt_dim_qk) * mask_clipped  # T.pow(decay, BT - j - 1)
-        T.copy(K_local_trans, K_local_trans_cast)
+            K_local_trans_cast[i, j] = K_local_trans[i, j]
+        # T.copy(K_local_trans, K_local_trans_cast)
 
-        # cross_chunk_decay = T.if_then_else(effective_chunk_size_correction < BT, mask[BT - 1, c] * decay, 1)  # T.pow(decay, BT)
         cross_chunk_decay = T.if_then_else(c < BT, mask[BT - 1, c] * decay, mask[0, 0])  # mask[0, 0] = 1
+        if copy_state_from_shared_to_local:
+            T.copy(state_shared, state_local)
         for i, j in T.Parallel(BK, BV):
             state_local[i, j] = state_local[i, j] * cross_chunk_decay
         T.gemm(K_local_trans_cast, V_shared, state_local, policy=T.GemmWarpPolicy.FullCol)
