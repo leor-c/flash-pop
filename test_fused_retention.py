@@ -18,7 +18,8 @@ logger.level(detail_level, no=15, color="<yellow>")
 # from fla.ops.linear_attn import fused_chunk_linear_attn as chunk_linear_attn
 # from fla.ops.linear_attn import chunk_linear_attn
 
-from fused_retention import fused_chunk_retention, ref_program, reference_grads
+from fused_retention import fused_chunk_retention
+from fused_retention.reference import ref_program, reference_grads
 
 
 def get_decays(num_heads: int, decay_range = None, device='cuda') -> torch.Tensor:

@@ -5,7 +5,7 @@ import torch
 from tilelang.profiler import do_bench
 from loguru import logger
 
-from fused_retention import ref_program_
+from fused_retention.reference import ref_program_
 from pop_retention import fused_pop_retention
 from test_fused_retention import Config as RetNetConfig, generate_inputs, get_err_ratio
 
