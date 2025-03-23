@@ -1,9 +1,5 @@
-import torch
 import tilelang
-import tilelang.language as T
-from tilelang import cached
-from torch import Tensor
-from einops import rearrange, einsum
+from tilelang import language as T
 
 
 def chunk_outputs_macro(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):

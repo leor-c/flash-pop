@@ -1,11 +1,10 @@
 import torch
 import tilelang
 from tilelang import cached
-from torch import Tensor
-from einops import rearrange, einsum
+from einops import rearrange
 
-from fused_retention.fused_chunk_bwd import fused_retention_bwd_dk_dv_ds, fused_retention_bwd_dq
-from fused_retention.fused_chunk_fwd import fused_chunk_retention_fwd
+from .fused_chunk_fwd import fused_chunk_retention_fwd
+from .fused_chunk_bwd import fused_retention_bwd_dk_dv_ds, fused_retention_bwd_dq
 
 
 class FusedChunkRetention(torch.autograd.Function):
@@ -94,5 +93,3 @@ def _get_decay_mask(head_decays, seq_len, device="cuda", dtype=torch.float32, re
         return decay_mask, head_decays_t
 
     return decay_mask
-
-
