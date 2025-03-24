@@ -1,10 +1,17 @@
 import torch
 import tilelang
-from tilelang import cached
 from einops import rearrange
 
 from .fused_chunk_fwd import fused_chunk_retention_fwd
 from .fused_chunk_bwd import fused_retention_bwd_dk_dv_ds, fused_retention_bwd_dq
+
+
+kernel_cache = {}
+def _get_kernel(key, fn):
+    if key in kernel_cache:
+        return kernel_cache[key]
+    kernel_cache[key] = fn()
+    return kernel_cache[key]
 
 
 class FusedChunkRetention(torch.autograd.Function):
@@ -14,15 +21,19 @@ class FusedChunkRetention(torch.autograd.Function):
         batch_size, seq_len, num_heads, dim_qk = q.shape
         dim_v = v.shape[-1]
 
-        block_K, block_V, block_T = 64, 64, 64
+        block_K, block_V, block_T = 64, 64, 32  # for GPUs with large memory try BT=64
 
         assert len(head_decays) == num_heads
         chunk_decays = _get_decay_mask(head_decays, block_T)
 
-        mod = tilelang.cached(fused_chunk_retention_fwd, [5, 6], batch_size, num_heads, seq_len, dim_qk, dim_v, block_K, block_V, block_T)
-        o, s_new = mod(q, k, v, s, chunk_decays)
+        # key = ('fused_chunk_retention_fwd', batch_size, num_heads, seq_len, dim_qk, dim_v, block_K, block_V, block_T)
+        f = fused_chunk_retention_fwd(batch_size, num_heads, seq_len, dim_qk, dim_v, block_K, block_V, block_T, threads=64)
+        # fn = lambda: tilelang.compile(f, [5, 6], target='cuda')
+        # mod = _get_kernel(key, fn)
+        mod = tilelang.cached(f, [5, 6], target='cuda')
+        o, s_out = mod(q, k, v, s, chunk_decays)
         ctx.save_for_backward(q, k, v, s, chunk_decays)
-        return o.sum(0), s_new.sum(0)
+        return o.sum(0), s_out.sum(0)
 
     @staticmethod
     def backward(ctx, dO, dS_new):
@@ -30,11 +41,11 @@ class FusedChunkRetention(torch.autograd.Function):
 
         batch_size, seq_len, num_heads, dim_qk = q.shape
         dim_v = v.shape[-1]
-        block_K, block_V, block_T = 64, 64, 64
+        block_K, block_V, block_T = 64, 64, 32  # for GPUs with large memory try BT=64
 
-        mod = tilelang.cached(fused_retention_bwd_dk_dv_ds, [6, 7, 8], batch_size, num_heads, seq_len, dim_qk, dim_v, block_K, block_V, block_T)
+        mod = tilelang.compile(fused_retention_bwd_dk_dv_ds(batch_size, num_heads, seq_len, dim_qk, dim_v, block_K, block_V, block_T), [6, 7, 8], target='cuda')
         dK, dV, dS = mod(q, k, v, chunk_decays, dO, dS_new)
-        mod2 = tilelang.cached(fused_retention_bwd_dq, [5], batch_size, num_heads, seq_len, dim_qk, dim_v, block_K, block_V, block_T)
+        mod2 = tilelang.compile(fused_retention_bwd_dq(batch_size, num_heads, seq_len, dim_qk, dim_v, block_K, block_V, block_T, threads=64), [5], target='cuda')
         dQ = mod2(k, v, s, chunk_decays, dO)
 
         return dQ.sum(0), dK.sum(0), dV.sum(0), dS.sum(0), None

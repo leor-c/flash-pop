@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from math import ceil
 
 import torch
+import tilelang
 from tilelang.profiler import do_bench
 from einops import rearrange
 from loguru import logger
@@ -14,9 +15,6 @@ detail_level = "detail"
 logger.level(detail_level, no=15, color="<yellow>")
 # logger.remove()
 # logger.add(sys.stderr, level="INFO")
-
-# from fla.ops.linear_attn import fused_chunk_linear_attn as chunk_linear_attn
-# from fla.ops.linear_attn import chunk_linear_attn
 
 from fused_retention import fused_chunk_retention
 from fused_retention.reference import ref_program, reference_grads
@@ -38,9 +36,9 @@ def get_mean_abs_err(x, y):
     return (x - y).flatten().abs().mean().item()
 
 
-def get_err_ratio(x, y):
-    err = (x - y).flatten().square().mean().sqrt().item()
-    base = (x).flatten().square().mean().sqrt().item()
+def get_err_ratio(approximation, reference):
+    err = (approximation - reference).flatten().square().mean().sqrt().item()
+    base = (reference).flatten().square().mean().sqrt().item()
     return err / base
 
 
@@ -58,12 +56,12 @@ class Config:
     dtype: torch.dtype = torch.bfloat16
 
 
-def generate_inputs(cfg: Config, apply_layer_norm: bool):
+def generate_inputs(cfg: Config, normalized: bool = False):
     qk_shape = (cfg.batch_size, cfg.seq_len, cfg.num_heads, cfg.dim_qk)
     v_shape = (cfg.batch_size, cfg.seq_len, cfg.num_heads, cfg.dim_v)
     # ln_qk = torch.nn.LayerNorm(cfg.dim_qk, device="cuda", dtype=cfg.dtype) if apply_layer_norm else lambda x: x
     # ln_v = torch.nn.LayerNorm(cfg.dim_v, device="cuda", dtype=cfg.dtype) if apply_layer_norm else lambda x: x
-    norm_f = lambda x: x.normal_()
+    norm_f = lambda x: x.normal_() if normalized else x
     norm_qk = norm_f
     norm_v = norm_f
     head_decays = tuple(get_decays(num_heads=cfg.num_heads, decay_range=cfg.decay_range).cpu().numpy().tolist())
@@ -105,7 +103,7 @@ def benchmark_run_times(cfg: Config):
     # total_flops = 2.0 * cfg.batch_size * cfg.num_heads * cfg.seq_len * cfg.seq_len * (cfg.dim_qk + cfg.dim_v)
     # print("Caveat: TFLOPs might be misleading here, but the larger the faster..")
 
-    inputs = generate_inputs(cfg, apply_layer_norm=False)
+    inputs = generate_inputs(cfg, normalized=False)
 
     latency = do_bench(partial(ref_program, *inputs))
     logger.info("Ref: {:.2f} ms".format(latency))
@@ -369,7 +367,7 @@ def test_backward_pass():
         decay_range=(5, 12),
     )
 
-    Q, K, V, S, head_decays = generate_inputs(cfg, True)
+    Q, K, V, S, head_decays = generate_inputs(cfg, normalized=False)
     Q, K, V, S = Q.requires_grad_(), K.requires_grad_(), V.requires_grad_(), S.requires_grad_()
     dO = torch.randn_like(V)
     dS_new = torch.randn_like(S)

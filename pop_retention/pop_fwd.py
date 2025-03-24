@@ -4,7 +4,7 @@ import tilelang.language as T
 from fused_retention.fused_chunk_fwd import chunk_outputs_macro, chunk_state_update_macro
 
 
-def fused_pop_retention_fwd(batch, heads, seq_len, block_size, dim_qk, dim_v, BK, BV, BT):
+def fused_pop_retention_fwd(batch, heads, seq_len, block_size, dim_qk, dim_v, BK, BV, BT, threads=64, dtype="bfloat16"):
     NK = T.ceildiv(dim_qk, BK)
     num_full_blocks = seq_len // block_size  # only keep states at the end/beginning of full blocks
     qk_shape = [batch, seq_len, heads, dim_qk]
@@ -12,7 +12,7 @@ def fused_pop_retention_fwd(batch, heads, seq_len, block_size, dim_qk, dim_v, BK
     o_shape = [NK, batch, seq_len, heads, dim_v]  # we have to reduce the first dimension
     state_shape = [batch, heads, dim_qk, dim_v]
     block_states_shape = [NK, batch, num_full_blocks, heads, dim_qk, dim_v]
-    dtype = "bfloat16"
+    assert dtype == "bfloat16"
     accum_dtype = "float"
 
     compute_retention_chunk_outputs = chunk_outputs_macro(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT)
@@ -45,7 +45,7 @@ def fused_pop_retention_fwd(batch, heads, seq_len, block_size, dim_qk, dim_v, BK
         Returns:
 
         """
-        with T.Kernel(heads, batch, T.ceildiv(dim_v, BV) * NK, threads=64) as (i_head, i_batch, bz):
+        with T.Kernel(heads, batch, T.ceildiv(dim_v, BV) * NK, threads=threads) as (i_head, i_batch, bz):
             i_bk = bz % NK
             i_bv = bz // NK
             Q_shared = T.alloc_shared([BT, BK], dtype)

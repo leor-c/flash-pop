@@ -2,6 +2,9 @@ import tilelang
 from tilelang import language as T
 
 
+# heavily modified https://github.com/sustcsonglin/fla-tilelang/blob/main/linear_attn/fused_chunk.py
+
+
 def chunk_outputs_macro(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
     NK = T.ceildiv(dim_qk, BK)
     o_shape = [NK, batch, seq_len, heads, dim_v]  # we have to reduce the first dimension
@@ -89,7 +92,7 @@ def chunk_state_update_macro(dim_qk, BK, BV, BT, copy_state_from_shared_to_local
     return update_recurrent_state
 
 
-def fused_chunk_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
+def fused_chunk_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT, threads=128):
     NK = T.ceildiv(dim_qk, BK)
     qk_shape = [batch, seq_len, heads, dim_qk]
     v_shape = [batch, seq_len, heads, dim_v]
@@ -113,7 +116,7 @@ def fused_chunk_retention_fwd(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT):
             Output: T.Buffer(o_shape, dtype),
             out_state: T.Buffer(out_state_shape, dtype),
     ):
-        with T.Kernel(heads, batch, T.ceildiv(dim_v, BV) * NK, threads=128) as (i_head, i_batch, bz):
+        with T.Kernel(heads, batch, T.ceildiv(dim_v, BV) * NK, threads=threads) as (i_head, i_batch, bz):
             i_bk = bz % NK
             i_bv = bz // NK
             Q_shared = T.alloc_shared([BT, BK], dtype)
