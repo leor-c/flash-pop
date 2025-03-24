@@ -5,8 +5,8 @@ import torch
 from tilelang.profiler import do_bench
 from loguru import logger
 
-from flash_pop.fused_retention.reference import ref_program_
-from flash_pop.pop_retention import flash_pop_retention
+from fused_retention.reference import ref_program_
+from pop_retention import flash_pop_retention
 from test_fused_retention import Config as RetNetConfig, generate_inputs, get_err_ratio, log_error_info, detail_level
 
 
@@ -35,29 +35,51 @@ def ref_pop(Q, K, V, prev_state, head_decays, block_size: int = 512, *args):
 def run_fwd_test(cfg, block_size):
     Q, K, V, S, head_decays = generate_inputs(cfg, False)
 
-    O_ref, states_ref = ref_pop(Q, K, V, S, head_decays, block_size=block_size)
-    O, states = flash_pop_retention(Q, K, V, S, head_decays, block_size)
+    O_ref, states_ref = ref_pop(Q.float(), K.float(), V.float(), S.float(), head_decays, block_size=block_size)
+    # O, states = flash_pop_retention(Q, K, V, S, head_decays, block_size)
 
-    o_diff = (O_ref - O).abs()
-    err_ratio = get_err_ratio(O, O_ref)
-    print(f"Err ratio: {err_ratio}, Mean out diff: {o_diff.mean()}, max out diff: {o_diff.max()}")
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    import tilelang
+    from pop_retention import pop_retention_bwd_dk_dv_ds, fused_retention_bwd_dq, fused_pop_retention_fwd
+    from fused_retention import _get_decay_mask
+    block_K, block_V, block_T = 64, 64, 32
+
+    chunk_decays = _get_decay_mask(head_decays, block_T)
+    f_fwd = fused_pop_retention_fwd(cfg.batch_size, cfg.num_heads, cfg.seq_len, block_size, cfg.dim_qk, cfg.dim_v,
+                                    block_K, block_V, block_T)
+    fwd_kernel = tilelang.compile(f_fwd, [5, 6], target='cuda')
+    O, states = fwd_kernel(Q, K, V, S, chunk_decays)
+    O, states = O.sum(0), states.sum(0)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    log_error_info(O, O_ref, 'O')
 
     print(f"states shape: {states.shape}, states_ref shape: {states_ref.shape}")
     assert states.shape == states_ref.shape, f"got {states.shape} != {states_ref.shape}"
-    s_diff = (states_ref - states).abs()
-    err_ratio = get_err_ratio(states, states_ref)
-    print(f"Err ratio: {err_ratio}, Mean states diff: {s_diff.mean()}, max states diff: {s_diff.max()}")
+    # s_diff = (states_ref - states).abs()
+    # err_ratio = get_err_ratio(states, states_ref)
+    # print(f"Err ratio: {err_ratio}, Mean states diff: {s_diff.mean()}, max states diff: {s_diff.max()}")
+    log_error_info(states, states_ref, 'states')
 
     print(f"{states[0, 0, 0]}")
     print(f"{states_ref[0, 0, 0]}")
 
-    from flash_pop.fused_retention import fused_chunk_retention
-    latency = do_bench(partial(flash_pop_retention, Q, K, V, S, head_decays, block_size))
-    logger.info("POP: {:.2f} ms".format(latency))
-    latency = do_bench(partial(fused_chunk_retention, Q, K, V, S, head_decays))
-    logger.info("RetNet: {:.2f} ms".format(latency))
+    from fused_retention import fused_chunk_retention
+    # latency = do_bench(partial(flash_pop_retention, Q, K, V, S, head_decays, block_size))
+    # logger.info("POP: {:.2f} ms".format(latency))
+    # latency = do_bench(partial(fused_chunk_retention, Q, K, V, S, head_decays))
+    # logger.info("RetNet: {:.2f} ms".format(latency))
     latency = do_bench(partial(ref_pop, Q, K, V, S, head_decays, block_size))
     logger.info("Pytorch Naive POP: {:.2f} ms".format(latency))
+
+    ######################
+    profiler = fwd_kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Normal)
+
+    def run(*args):
+        fwd_kernel(Q, K, V, S, chunk_decays)
+
+    latency = profiler.do_bench(run, warmup=500)
+    logger.log(detail_level, f"Tilelang latency (ms): {latency}")
 
 
 def run_bwd_test(cfg, block_size):
@@ -80,8 +102,8 @@ def run_bwd_test(cfg, block_size):
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     import tilelang
-    from flash_pop.pop_retention import pop_retention_bwd_dk_dv_ds, fused_retention_bwd_dq, fused_pop_retention_fwd
-    from flash_pop.fused_retention import _get_decay_mask
+    from pop_retention import pop_retention_bwd_dk_dv_ds, fused_retention_bwd_dq, fused_pop_retention_fwd
+    from fused_retention import _get_decay_mask
     block_K, block_V, block_T = 64, 64, 32
 
     chunk_decays = _get_decay_mask(head_decays, block_T)
@@ -185,7 +207,7 @@ def test_training_scenario():
     cfg = RetNetConfig(
         batch_size=8,
         num_heads=4,
-        seq_len=block_size*20,
+        seq_len=block_size*80,
         dim_qk=64,
         dim_v=128,
         block_K=64,
@@ -227,9 +249,9 @@ def test_training_scenario():
 def test_bwd():
     block_size = 500
     cfg = RetNetConfig(
-        batch_size=2**6,
+        batch_size=2**3,
         num_heads=4,
-        seq_len=2**11,
+        seq_len=2**9,
         dim_qk=64,
         dim_v=64,
         block_K=64,
@@ -242,5 +264,5 @@ def test_bwd():
 
 if __name__ == '__main__':
     # test_generation_scenario()
-    # test_training_scenario()
+    test_training_scenario()
     test_bwd()

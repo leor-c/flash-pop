@@ -1,7 +1,7 @@
 import tilelang
 import tilelang.language as T
 
-from flash_pop.fused_retention.fused_chunk_fwd import chunk_outputs_macro, chunk_state_update_macro
+from fused_retention.fused_chunk_fwd import chunk_outputs_macro, chunk_state_update_macro
 
 
 def fused_pop_retention_fwd(batch, heads, seq_len, block_size, dim_qk, dim_v, BK, BV, BT, threads=64, dtype="bfloat16"):
@@ -63,17 +63,16 @@ def fused_pop_retention_fwd(batch, heads, seq_len, block_size, dim_qk, dim_v, BK
             mask = T.alloc_shared((BT, BT), accum_dtype)
             segment_state_local = T.alloc_fragment((BK, BV), accum_dtype)
 
-            state_shared = T.alloc_fragment((BK, BV), dtype, scope="shared")
+            state_cast = T.alloc_shared((BK, BV), dtype)
+            state_shared = T.alloc_shared((BK, BV), accum_dtype)
 
             T.annotate_layout({
                 Q_shared: tilelang.layout.make_swizzled_layout(Q_shared),
                 output_shared: tilelang.layout.make_swizzled_layout(output_shared),
-                state_shared: tilelang.layout.make_swizzled_layout(state_shared),
+                state_cast: tilelang.layout.make_swizzled_layout(state_cast),
             })
 
-            T.clear(state_local)
             T.copy(state[i_batch, i_head, i_bk * BK:(i_bk + 1) * BK, i_bv * BV:(i_bv + 1) * BV], state_shared)
-            T.copy(state_shared, state_local)
 
             # init decay values:
             T.copy(chunk_decays_mask[i_head, :, :], mask)
@@ -86,11 +85,12 @@ def fused_pop_retention_fwd(batch, heads, seq_len, block_size, dim_qk, dim_v, BK
                 T.copy(V[i_batch, k * BT:(k + 1) * BT, i_head, i_bv * BV:(i_bv + 1) * BV], V_shared)
                 effective_chunk_size_correction = T.max(0, ((k+1)*BT) - seq_len)
 
+                T.copy(state_shared, state_cast)
                 compute_retention_chunk_outputs(
                     attention_scores_local,
                     attention_scores_cast,
                     mask,
-                    state_shared,
+                    state_cast,
                     output_shared,
                     output_local,
                     Q_shared,
@@ -124,7 +124,7 @@ def fused_pop_retention_fwd(batch, heads, seq_len, block_size, dim_qk, dim_v, BK
                         c,
                     )
 
-
+                T.copy(state_shared, state_local)
                 update_recurrent_state(
                     mask,
                     K_shared,
