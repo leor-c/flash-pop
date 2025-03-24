@@ -44,10 +44,11 @@ def pop_retention_bwd_dk_dv_ds(batch, heads, seq_len, block_size, dim_qk, dim_v,
             BK_BT_cast = T.alloc_fragment([BK, BT], dtype)
             V_shared = T.alloc_shared([BT, BV], dtype)
 
-            dO_shared = T.alloc_shared([BT, BV], dtype)
+            do_shared = T.alloc_shared([BT, BV], dtype)
             BT_BV_shared = T.alloc_shared([BT, BV], dtype)
-            dS_out_shared = T.alloc_shared([BK, BV], dtype)
-            dS_out_shared2 = T.alloc_shared([BK, BV], dtype)
+            ds_out_cast = T.alloc_shared([BK, BV], dtype)
+            ds_out_cast2 = T.alloc_shared([BK, BV], dtype)
+            ds_out_shared = T.alloc_shared((BK, BV), accum_dtype)
 
             mask = T.alloc_shared((BT, BT), accum_dtype)
 
@@ -59,14 +60,14 @@ def pop_retention_bwd_dk_dv_ds(batch, heads, seq_len, block_size, dim_qk, dim_v,
             d_state_dk_buffer = T.alloc_fragment((BT, BK), accum_dtype)
             BT_BK_buffer2 = T.alloc_fragment((BT, BK), accum_dtype)
             BT_BK_cast = T.alloc_shared((BT, BK), dtype)
-            dS_local = T.alloc_fragment((BK, BV), accum_dtype)
-            dK_shared = T.alloc_shared((BT, BK), dtype)
-            dV_shared = T.alloc_shared((BT, BV), dtype)
+            ds_local = T.alloc_fragment((BK, BV), accum_dtype)
+            dk_shared = T.alloc_shared((BT, BK), accum_dtype)
+            dv_shared = T.alloc_shared((BT, BV), accum_dtype)
 
             # T.annotate_layout({
             #     Q_shared: tilelang.layout.make_swizzled_layout(Q_shared),
-            #     dO_shared: tilelang.layout.make_swizzled_layout(dO_shared),
-            #     dS_out_shared: tilelang.layout.make_swizzled_layout(dS_out_shared),
+            #     do_shared: tilelang.layout.make_swizzled_layout(do_shared),
+            #     ds_out_cast: tilelang.layout.make_swizzled_layout(ds_out_cast),
             # })
 
             i_bk = bz % NK
@@ -76,15 +77,16 @@ def pop_retention_bwd_dk_dv_ds(batch, heads, seq_len, block_size, dim_qk, dim_v,
             T.copy(chunk_decays_mask[i_head, :, :], mask)
             decay = mask[1, 0]
 
-            T.clear(dS_local)
-            T.copy(dS_local, dS_out_shared)
+            T.clear(ds_local)
+            T.copy(ds_local, ds_out_shared)
+            T.copy(ds_out_shared, ds_out_cast)
 
             loop_range = T.ceildiv(seq_len, BT)
             for k_tag in T.Pipelined(loop_range, num_stages=0):
                 k = loop_range - 1 - k_tag
                 effective_chunk_size_correction = T.max(0, ((k + 1) * BT) - seq_len)
 
-                T.copy(dO[i_batch, k * BT:(k + 1) * BT, i_head, i_bv * BV:(i_bv + 1) * BV], dO_shared)
+                T.copy(dO[i_batch, k * BT:(k + 1) * BT, i_head, i_bv * BV:(i_bv + 1) * BV], do_shared)
                 T.copy(V[i_batch, k * BT:(k + 1) * BT, i_head, i_bv * BV:(i_bv + 1) * BV], V_shared)
                 T.copy(K[i_batch, k * BT:(k + 1) * BT, i_head, i_bk * BK:(i_bk + 1) * BK], K_shared)
 
@@ -93,14 +95,14 @@ def pop_retention_bwd_dk_dv_ds(batch, heads, seq_len, block_size, dim_qk, dim_v,
                     Q_shared,
                     V_shared,
                     mask,
-                    dO_shared,
-                    dS_out_shared,
+                    do_shared,
+                    ds_out_cast,
                     d_state_dk_buffer,  # BT_BK_buffer
                     BT_BV_buffer,
                     BT_BV_shared,
                     BT_BT_buffer,
                     BT_BT_cast,
-                    dK_shared,
+                    dk_shared,
                     effective_chunk_size_correction
                 )
 
@@ -108,23 +110,23 @@ def pop_retention_bwd_dk_dv_ds(batch, heads, seq_len, block_size, dim_qk, dim_v,
                     K_shared,
                     Q_shared,
                     mask,
-                    dO_shared,
-                    dS_out_shared,
+                    do_shared,
+                    ds_out_cast,
                     BT_BK_buffer,
                     BT_BK_cast,
                     BT_BV_buffer,
                     BT_BT_buffer,
                     BT_BT_cast,
-                    dV_shared,
+                    dv_shared,
                     effective_chunk_size_correction
                 )
 
                 compute_dS(
                     Q_shared,
                     mask,
-                    dO_shared,
-                    dS_out_shared,
-                    dS_local,
+                    do_shared,
+                    ds_out_shared,
+                    ds_local,
                     BK_BT_cast,
                     BT_BV_buffer,
                     BT_BV_shared,
@@ -140,23 +142,24 @@ def pop_retention_bwd_dk_dv_ds(batch, heads, seq_len, block_size, dim_qk, dim_v,
                 block_idx = first_token_block
                 next_block_start_idx = (block_idx + 1) * block_size - k * BT
 
-                T.copy(dK_shared, BT_BK_buffer)
-                T.copy(dV_shared, BT_BV_buffer)
+                T.copy(dk_shared, d_state_dk_buffer)
+                T.copy(dv_shared, BT_BV_buffer)
                 for i_block in T.Pipelined(num_iterations, num_stages=0):
-                    T.copy(d_block_states[i_batch, block_idx + i_block, i_head, i_bk * BK:(i_bk + 1) * BK, i_bv * BV:(i_bv + 1) * BV], dS_out_shared2)
+                    T.copy(d_block_states[i_batch, block_idx + i_block, i_head, i_bk * BK:(i_bk + 1) * BK, i_bv * BV:(i_bv + 1) * BV], ds_out_cast2)
                     c = BT - (next_block_start_idx + i_block * block_size)
 
-                    accumulate_ds_out_dk(V_shared, mask, dS_out_shared2, d_state_dk_buffer, BT_BV_buffer2, BT_BV_shared, c)
-                    accumulate_ds_out_dv(K_shared, mask, dS_out_shared2, BT_BK_buffer2, BT_BK_cast, BT_BV_buffer, c)
+                    accumulate_ds_out_dk(V_shared, mask, ds_out_cast2, d_state_dk_buffer, BT_BV_buffer2, BT_BV_shared, c)
+                    accumulate_ds_out_dv(K_shared, mask, ds_out_cast2, BT_BK_buffer2, BT_BK_cast, BT_BV_buffer, c)
                     # Accumulate d_state_out / d_state:
                     cross_chunk_decay = mask[BT - 1, c] * decay
                     for i, j in T.Parallel(BK, BV):
-                        dS_local[i, j] += dS_out_shared2[i, j] * cross_chunk_decay
+                        ds_local[i, j] += ds_out_cast2[i, j] * cross_chunk_decay
 
-                T.copy(dS_local, dS_out_shared)
+                T.copy(ds_local, ds_out_shared)
+                T.copy(ds_out_shared, ds_out_cast)
                 T.copy(d_state_dk_buffer, dK[i_bk, i_batch, k * BT:(k + 1) * BT, i_head, i_bk * BK:(i_bk + 1) * BK])
                 T.copy(BT_BV_buffer, dV[i_bk, i_batch, k * BT:(k + 1) * BT, i_head, i_bv * BV:(i_bv + 1) * BV])
 
-            T.copy(dS_out_shared, dS[i_bk, i_batch, i_head, i_bk * BK:(i_bk + 1) * BK, i_bv * BV:(i_bv + 1) * BV])
+            T.copy(ds_out_cast, dS[i_bk, i_batch, i_head, i_bk * BK:(i_bk + 1) * BK, i_bv * BV:(i_bv + 1) * BV])
 
     return main
