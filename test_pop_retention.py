@@ -62,26 +62,48 @@ def run_fwd_test(cfg, block_size):
 
 def run_bwd_test(cfg, block_size):
     Q, K, V, S, head_decays = generate_inputs(cfg, False)
+    Q32, K32, V32, S32 = Q.float(), K.float(), V.float(), S.float()
     Q, K, V, S = Q.requires_grad_(), K.requires_grad_(), V.requires_grad_(), S.requires_grad_()
+    Q32, K32, V32, S32 = Q32.requires_grad_(), K32.requires_grad_(), V32.requires_grad_(), S32.requires_grad_()
 
-    Q32, K32, V32, S32 = Q.float(), K.float(),V.float(),S.float()
     O_ref, states_ref = ref_pop(Q32, K32, V32, S32, head_decays, block_size=block_size)
     O, states = flash_pop_retention(Q, K, V, S, head_decays, block_size)
 
     d_out = torch.randn_like(O)
     d_states = torch.randn_like(states)
 
-    ((O * d_out.clone()).sum() + (states * d_states.clone()).sum()).backward(retain_graph=True)
-    dQ, Q.grad = Q.grad.clone(), None
-    dK, K.grad = K.grad.clone(), None
-    dV, V.grad = V.grad.clone(), None
-    dS, S.grad = S.grad.clone(), None
+    # ((O * d_out.clone()).sum() + (states * d_states.clone()).sum()).backward(retain_graph=True)
+    # dQ, Q.grad = Q.grad.clone(), None
+    # dK, K.grad = K.grad.clone(), None
+    # dV, V.grad = V.grad.clone(), None
+    # dS, S.grad = S.grad.clone(), None
 
-    ((O_ref * d_out.clone().float()).sum() + (states_ref * d_states.clone().float()).sum()).backward(retain_graph=True)
-    dQ_ref, Q.grad = Q.grad.clone(), None
-    dK_ref, K.grad = K.grad.clone(), None
-    dV_ref, V.grad = V.grad.clone(), None
-    dS_ref, S.grad = S.grad.clone(), None
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    import tilelang
+    from pop_retention import pop_retention_bwd_dk_dv_ds, fused_retention_bwd_dq, fused_pop_retention_fwd
+    from fused_retention import _get_decay_mask
+    block_K, block_V, block_T = 64, 64, 32
+
+    chunk_decays = _get_decay_mask(head_decays, block_T)
+    f_fwd = fused_pop_retention_fwd(cfg.batch_size, cfg.num_heads, cfg.seq_len, block_size, cfg.dim_qk, cfg.dim_v, block_K, block_V, block_T)
+    fwd_kernel = tilelang.compile(f_fwd, [5, 6], target='cuda')
+    f = pop_retention_bwd_dk_dv_ds(cfg.batch_size, cfg.num_heads, cfg.seq_len, block_size, cfg.dim_qk, cfg.dim_v, block_K, block_V, block_T)
+    bwd_kernel1 = tilelang.compile(f, [6, 7, 8], target='cuda')
+    dK, dV, dS = bwd_kernel1(Q, K, V, chunk_decays, d_out, d_states)
+    bwd_kernel2 = tilelang.compile(
+        fused_retention_bwd_dq(cfg.batch_size, cfg.num_heads, cfg.seq_len, cfg.dim_qk, cfg.dim_v, block_K, block_V, block_T), [5],
+        target='cuda')
+    dQ = bwd_kernel2(K, V, S, chunk_decays, d_out)
+
+    dQ, dK, dV, dS = dQ.sum(0), dK.sum(0), dV.sum(0), dS.sum(0)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    d_out32 = d_out.clone().float()
+    d_states32 = d_states.clone().float()
+    ((O_ref * d_out32).sum() + (states_ref * d_states32).sum()).backward(retain_graph=True)
+    dQ_ref, Q32.grad = Q32.grad.clone(), None
+    dK_ref, K32.grad = K32.grad.clone(), None
+    dV_ref, V32.grad = V32.grad.clone(), None
+    dS_ref, S32.grad = S32.grad.clone(), None
 
     logger.log(detail_level, f"dQ_ref: {dQ_ref.flatten()[:10]}")
     logger.log(detail_level, f"dQ: {dQ.flatten()[:10]}")
@@ -98,6 +120,20 @@ def run_bwd_test(cfg, block_size):
     logger.log(detail_level, f"dS_ref: {dS_ref.flatten()[:10]}")
     logger.log(detail_level, f"dS: {dS.flatten()[:10]}")
     log_error_info(dS, dS_ref, 'dS')
+
+    profiler = bwd_kernel1.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Normal)
+    def run(*args):
+        fwd_kernel(Q, K, V, S, chunk_decays)
+        bwd_kernel1(Q, K, V, chunk_decays, d_out, d_states)
+        bwd_kernel2(K, V, S, chunk_decays, d_out)
+    latency = profiler.do_bench(run, warmup=500)
+    logger.log(detail_level, f"Tilelang latency (ms): {latency}")
+    def run_ref(*args):
+        O_ref, states_ref = ref_pop(Q, K, V, S, head_decays, block_size=block_size)
+        ((O_ref * d_out.clone().float()).sum() + (states_ref * d_states.clone().float()).sum()).backward(retain_graph=True)
+    latency = profiler.do_bench(run_ref, warmup=500)
+    logger.log(detail_level, f"Pytorch latency (ms): {latency}")
+
 
 
 def test_generation_scenario():
@@ -189,11 +225,11 @@ def test_training_scenario():
 
 
 def test_bwd():
-    block_size = 32
+    block_size = 500
     cfg = RetNetConfig(
-        batch_size=8,
+        batch_size=2**6,
         num_heads=4,
-        seq_len=2**15,
+        seq_len=2**11,
         dim_qk=64,
         dim_v=64,
         block_K=64,

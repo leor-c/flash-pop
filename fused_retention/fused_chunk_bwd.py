@@ -382,7 +382,7 @@ def fused_retention_bwd_dq(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT, thr
             BT_BT_cast = T.alloc_shared((BT, BT), dtype)
             BT_BV_buffer = T.alloc_fragment((BT, BV), accum_dtype)
             BT_BK_buffer = T.alloc_fragment((BT, BK), accum_dtype)
-            dq_shared = T.alloc_shared((BT, BK), dtype)
+            dq_shared = T.alloc_shared((BT, BK), accum_dtype)
             BK_BT_buffer = T.alloc_fragment((BK, BT), accum_dtype)
             state_local = T.alloc_fragment((BK, BV), accum_dtype)
             state_shared = T.alloc_shared((BK, BV), accum_dtype)
@@ -391,6 +391,7 @@ def fused_retention_bwd_dq(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT, thr
             #     dQ: tilelang.layout.make_swizzled_layout(dQ),
             #     dO_shared: tilelang.layout.make_swizzled_layout(dO_shared),
             # })
+            # T.annotate_layout({dO_shared: tilelang.layout.make_swizzled_layout(dO_shared)})
 
             i_bk = bz % NK
             i_bv = bz // NK
@@ -399,7 +400,7 @@ def fused_retention_bwd_dq(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT, thr
             T.copy(chunk_decays_mask[i_head, :, :], mask)
             decay = mask[1, 0]
 
-            T.copy(state[i_batch, i_head, i_bk * BK:(i_bk + 1) * BK, i_bv * BV:(i_bv + 1) * BV], state_cast)
+            T.copy(state[i_batch, i_head, i_bk * BK:(i_bk + 1) * BK, i_bv * BV:(i_bv + 1) * BV], state_shared)
 
             loop_range = T.ceildiv(seq_len, BT)
             for k in T.Pipelined(loop_range, num_stages=0):
@@ -414,15 +415,18 @@ def fused_retention_bwd_dq(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT, thr
                 T.copy(BT_BT_buffer, BT_BT_cast)
                 T.copy(K[i_batch, k * BT:(k + 1) * BT, i_head, i_bk * BK:(i_bk + 1) * BK], K_shared)
                 T.gemm(BT_BT_cast, K_shared, BT_BK_buffer, policy=T.GemmWarpPolicy.FullCol, clear_accum=True)
+                T.copy(BT_BK_buffer, dq_shared)
 
+                # Second term (dO * \zeta) @ S^T:
                 # T.copy(dO_shared, BT_BV_buffer)
                 for i, j in T.Parallel(BT, BV):
                     BT_BV_buffer[i, j] = dO_shared[i, j] * (mask[i, 0] * decay)
                 T.copy(BT_BV_buffer, BT_BV_shared)
 
+                T.copy(state_shared, state_cast)
+                T.copy(dq_shared, BT_BK_buffer)
                 T.gemm(BT_BV_shared, state_cast, BT_BK_buffer, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
                 T.copy(BT_BK_buffer, dq_shared)
-                T.copy(dq_shared, dQ[i_bk, i_batch, k * BT:(k + 1) * BT, i_head, i_bk * BK:(i_bk + 1) * BK])
 
                 # update the state:
                 c = T.max(0, ((k + 1) * BT) - seq_len)
@@ -438,6 +442,8 @@ def fused_retention_bwd_dq(batch, heads, seq_len, dim_qk, dim_v, BK, BV, BT, thr
                     decay,
                     c
                 )
-                T.copy(state_shared, state_cast)
+
+                T.copy(dq_shared, dQ[i_bk, i_batch, k * BT:(k + 1) * BT, i_head, i_bk * BK:(i_bk + 1) * BK])
+
 
     return main
