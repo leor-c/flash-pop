@@ -5,8 +5,8 @@ import torch
 from tilelang.profiler import do_bench
 from loguru import logger
 
-from fused_retention.reference import ref_program_
-from pop_retention import flash_pop_retention
+from flash_pop.fused_retention.reference import ref_program_
+from flash_pop.pop_retention import flash_pop_retention
 from test_fused_retention import Config as RetNetConfig, generate_inputs, get_err_ratio, log_error_info, detail_level
 
 
@@ -51,7 +51,7 @@ def run_fwd_test(cfg, block_size):
     print(f"{states[0, 0, 0]}")
     print(f"{states_ref[0, 0, 0]}")
 
-    from fused_retention import fused_chunk_retention
+    from flash_pop.fused_retention import fused_chunk_retention
     latency = do_bench(partial(flash_pop_retention, Q, K, V, S, head_decays, block_size))
     logger.info("POP: {:.2f} ms".format(latency))
     latency = do_bench(partial(fused_chunk_retention, Q, K, V, S, head_decays))
@@ -80,8 +80,8 @@ def run_bwd_test(cfg, block_size):
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     import tilelang
-    from pop_retention import pop_retention_bwd_dk_dv_ds, fused_retention_bwd_dq, fused_pop_retention_fwd
-    from fused_retention import _get_decay_mask
+    from flash_pop.pop_retention import pop_retention_bwd_dk_dv_ds, fused_retention_bwd_dq, fused_pop_retention_fwd
+    from flash_pop.fused_retention import _get_decay_mask
     block_K, block_V, block_T = 64, 64, 32
 
     chunk_decays = _get_decay_mask(head_decays, block_T)

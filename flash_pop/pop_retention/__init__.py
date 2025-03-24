@@ -1,10 +1,10 @@
 import torch
 import tilelang
 
-from fused_retention import _get_decay_mask
+from flash_pop.fused_retention import _get_decay_mask
 from .pop_fwd import fused_pop_retention_fwd
 from .pop_bwd import pop_retention_bwd_dk_dv_ds
-from fused_retention.fused_chunk_bwd import fused_retention_bwd_dq
+from flash_pop.fused_retention.fused_chunk_bwd import fused_retention_bwd_dq
 
 
 class FlashPOPRetention(torch.autograd.Function):

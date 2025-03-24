@@ -1,23 +1,20 @@
-import argparse
 from functools import partial
 
 from dataclasses import dataclass
-from math import ceil
 
 import torch
 import tilelang
 from tilelang.profiler import do_bench
 from einops import rearrange
 from loguru import logger
-import sys
 
 detail_level = "detail"
 logger.level(detail_level, no=15, color="<yellow>")
 # logger.remove()
 # logger.add(sys.stderr, level="INFO")
 
-from fused_retention import fused_chunk_retention
-from fused_retention.reference import ref_program, reference_grads
+from flash_pop.fused_retention import fused_chunk_retention
+from flash_pop.fused_retention.reference import ref_program, reference_grads
 
 
 def get_decays(num_heads: int, decay_range = None, device='cuda') -> torch.Tensor:
@@ -254,7 +251,7 @@ def test_reference_grads():
         dtype=torch.float32,
     )
 
-    from fused_retention.reference import reference_grads
+    from flash_pop.fused_retention.reference import reference_grads
     Q, K, V, S, head_decays = generate_inputs(cfg, False)
     Q, K, V, S = Q.requires_grad_(), K.requires_grad_(), V.requires_grad_(), S.requires_grad_()
     dO = torch.randn_like(V)
@@ -299,7 +296,7 @@ def test_reference_grads_bfloat16():
         # dtype=torch.float32,
     )
 
-    from fused_retention.reference import reference_grads
+    from flash_pop.fused_retention.reference import reference_grads
     Q, K, V, S, head_decays = generate_inputs(cfg, False)
     Q, K, V, S = Q.requires_grad_(), K.requires_grad_(), V.requires_grad_(), S.requires_grad_()
     dO = torch.randn_like(V)
