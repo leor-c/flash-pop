@@ -1,12 +1,12 @@
 services:
-  fla:
+  flash_pop:
     build: ./
-    container_name: fla_c
+    container_name: fp_c
     #environment:
     #  - DISPLAY=$DISPLAY
     shm_size: '8gb'
     volumes:
-      - .:/FLA
+      - .:/flash_pop
       - /tmp/.X11-unix:/tmp/.X11-unix
     stdin_open: true # docker run -i
     tty: true        # docker run -t
