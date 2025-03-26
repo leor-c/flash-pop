@@ -13,8 +13,8 @@ logger.level(detail_level, no=15, color="<yellow>")
 # logger.remove()
 # logger.add(sys.stderr, level="INFO")
 
-from flash_pop.fused_retention import fused_chunk_retention
-from flash_pop.fused_retention.reference import ref_program, reference_grads
+from fused_retention import fused_chunk_retention
+from fused_retention.reference import ref_program, reference_grads
 
 
 def get_decays(num_heads: int, decay_range = None, device='cuda') -> torch.Tensor:

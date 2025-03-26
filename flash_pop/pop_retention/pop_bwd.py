@@ -1,7 +1,7 @@
 import tilelang
 import tilelang.language as T
 
-from flash_pop.fused_retention.fused_chunk_bwd import (
+from fused_retention.fused_chunk_bwd import (
     compute_dk_macro, compute_dv_macro, compute_ds_macro, accumulate_ds_out_dk_macro, accumulate_ds_out_dv_macro,
 )
 

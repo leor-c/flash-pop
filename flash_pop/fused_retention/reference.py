@@ -4,7 +4,7 @@ import torch
 from torch import Tensor
 from einops import rearrange, einsum
 
-from flash_pop.fused_retention import _get_decay_mask
+from . import _get_decay_mask
 
 
 def ref_program_(Q, K, V, prev_state, head_decays):
