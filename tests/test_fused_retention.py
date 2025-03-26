@@ -492,18 +492,18 @@ def test_utilization():
     )
     inputs = generate_inputs(cfg, False)
     logger.info("Testing utilization...")
-    for _ in range(10*3000):
+    for i in range(10*3000):
         fused_chunk_retention(*inputs)
 
 
 if __name__ == "__main__":
     # test_single_chunk_forward()
-    # test_multi_chunk_forward()
+    test_multi_chunk_forward()
     # test_ref_chunkwise_correctness()
     # test_reference_grads()
     # test_reference_grads_bfloat16()
     # benchmark_fwd_bwd_times()
     test_backward_pass()
-    # test_utilization()
+    test_utilization()
 
 

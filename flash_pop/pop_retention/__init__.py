@@ -5,6 +5,7 @@ from fused_retention import _get_decay_mask
 from .pop_fwd import fused_pop_retention_fwd
 from .pop_bwd import pop_retention_bwd_dk_dv_ds
 from fused_retention.fused_chunk_bwd import fused_retention_bwd_dq
+from utils import cached
 
 
 class FlashPOPRetention(torch.autograd.Function):
@@ -21,10 +22,11 @@ class FlashPOPRetention(torch.autograd.Function):
         assert len(head_decays) == num_heads
         chunk_decays = _get_decay_mask(head_decays, block_T)
 
-        # mod = tilelang.cached(fused_pop_retention_fwd, [5, 6], batch_size, num_heads, seq_len, block_size, dim_qk, dim_v, block_K, block_V, block_T)
-        f = fused_pop_retention_fwd(batch_size, num_heads, seq_len, block_size, dim_qk, dim_v, block_K, block_V, block_T)
-        mod = tilelang.cached(f, [5, 6], target='cuda')
-        o, block_states = mod(q, k, v, s, chunk_decays)
+        # kernel = tilelang.cached(fused_pop_retention_fwd, [5, 6], batch_size, num_heads, seq_len, block_size, dim_qk, dim_v, block_K, block_V, block_T)
+        # f = fused_pop_retention_fwd(batch_size, num_heads, seq_len, block_size, dim_qk, dim_v, block_K, block_V, block_T)
+        # kernel = tilelang.cached(f, [5, 6], target='cuda')
+        kernel = cached(fused_pop_retention_fwd, [5, 6], batch_size, num_heads, seq_len, block_size, dim_qk, dim_v, block_K, block_V, block_T)
+        o, block_states = kernel(q, k, v, s, chunk_decays)
         ctx.save_for_backward(q, k, v, s, chunk_decays)
         return o.sum(0), block_states.sum(0)
 
@@ -38,12 +40,12 @@ class FlashPOPRetention(torch.autograd.Function):
         block_size = seq_len // num_full_blocks
         block_K, block_V, block_T = 64, 64, 32
 
-        # mod = tilelang.cached(pop_retention_bwd_dk_dv_ds, [6, 7, 8], batch_size, num_heads, seq_len, block_size, dim_qk, dim_v, block_K, block_V, block_T)
-        mod = tilelang.compile(pop_retention_bwd_dk_dv_ds(batch_size, num_heads, seq_len, block_size, dim_qk, dim_v, block_K, block_V, block_T), [6, 7, 8], target='cuda')
-        dK, dV, dS = mod(q, k, v, chunk_decays, do, d_block_states)
-        # mod2 = tilelang.cached(fused_retention_bwd_dq, [5], batch_size, num_heads, seq_len, dim_qk, dim_v, block_K, block_V, block_T)
-        mod2 = tilelang.compile(fused_retention_bwd_dq(batch_size, num_heads, seq_len, dim_qk, dim_v, block_K, block_V, block_T), [5], target='cuda')
-        dQ = mod2(k, v, s, chunk_decays, do)
+        kernel1 = cached(pop_retention_bwd_dk_dv_ds, [6, 7, 8], batch_size, num_heads, seq_len, block_size, dim_qk, dim_v, block_K, block_V, block_T)
+        # kernel1 = tilelang.compile(pop_retention_bwd_dk_dv_ds(batch_size, num_heads, seq_len, block_size, dim_qk, dim_v, block_K, block_V, block_T), [6, 7, 8], target='cuda')
+        dK, dV, dS = kernel1(q, k, v, chunk_decays, do, d_block_states)
+        kernel2 = cached(fused_retention_bwd_dq, [5], batch_size, num_heads, seq_len, dim_qk, dim_v, block_K, block_V, block_T)
+        # kernel2 = tilelang.compile(fused_retention_bwd_dq(batch_size, num_heads, seq_len, dim_qk, dim_v, block_K, block_V, block_T), [5], target='cuda')
+        dQ = kernel2(k, v, s, chunk_decays, do)
 
         return dQ.sum(0), dK.sum(0), dV.sum(0), dS.sum(0), None, None
 
