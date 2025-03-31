@@ -70,7 +70,7 @@ def run_test_layer(cfg: TestConfig):
 
     # warmup:
     # layer.forward_chunkwise(x, 0, prev_state=None)
-
+    #
     # t0 = time.time()
     # with torch.no_grad():
     #     for _ in range(2000):
@@ -90,7 +90,8 @@ def test_retnet(cfg: TestConfig):
         head_dim_qk=cfg.head_dim_qk,
         dim_feedforward=cfg.head_dim_v * 2,
     )
-    num_layers = 10
+    num_layers = 20
+    # layers = [RetNetDecoderLayer(retnet_cfg) for _ in range(num_layers)]
     retnet = RetNetDecoder(retnet_cfg, num_layers)
 
     d_model = cfg.head_dim_v * cfg.num_heads
@@ -98,9 +99,27 @@ def test_retnet(cfg: TestConfig):
 
     def run():
         retnet(x)
-
-    latency = do_bench(run, warmup=100)
+        # y = x
+        # for i in range(num_layers):
+        #     y = layers[i](y)[0]
+    with torch.no_grad():
+        latency = do_bench(run, warmup=100, rep=100)
     print(f"RetNet latency (ms): {latency}")
+
+
+def test_t():
+    device = 'cuda'
+    decoder_layer = torch.nn.TransformerDecoderLayer(d_model=512, nhead=4, device=device)
+    transformer_decoder = torch.nn.TransformerDecoder(decoder_layer, num_layers=5)
+    memory = torch.rand(10, 2**11, 512, device=device)
+    tgt = torch.rand(20, 2**11, 512, device=device)
+
+    with torch.no_grad():
+        t0 = time.time()
+        for _ in range(100):
+            out = transformer_decoder(tgt, memory)
+        t1 = time.time()
+        print(f"TransformerDecoder total time (s): {t1-t0}")
 
 
 
@@ -112,9 +131,10 @@ def sanity_check():
         head_dim_qk=64,
         head_dim_v=128,
     )
-    run_test(cfg)
-    run_test_layer(cfg)
+    # run_test(cfg)
+    # run_test_layer(cfg)
     test_retnet(cfg)
+    # test_t()
 
 
 if __name__ == '__main__':

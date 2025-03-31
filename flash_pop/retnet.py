@@ -64,6 +64,7 @@ def _build_decay_gammas(
     return 1 - x.exp_()
 
 
+@lru_cache(maxsize=1)
 def get_decays(num_heads: int, decay_range: Optional[tuple[float, float]] = None) -> np.ndarray:
     if decay_range is None:
         decay_exp = -5 -np.arange(num_heads)
@@ -107,42 +108,6 @@ def _theta_shift(x: Tensor, sin: Tensor, cos: Tensor) -> Tensor:
 @torch.compile()
 def apply_relative_position(q, k, start_idx: Union[int, torch.Tensor], thetas: Tensor) -> Tuple[Tensor, Tensor]:
     indices = torch.arange(q.size(2), device=q.device, dtype=q.dtype)
-
-    if isinstance(start_idx, int):
-        assert thetas is not None
-        # Combined (cross + intra chunk):
-        indices = start_idx + indices
-        indices = indices.reshape(1, 1, -1, 1)
-
-    elif isinstance(start_idx, torch.Tensor):
-        assert start_idx.dim() == 1
-        indices = start_idx.view(-1, 1) + indices.view(1, -1)
-        indices = indices.reshape(indices.shape[0], 1, indices.shape[1], 1)
-
-    else:
-        assert False, f"Unsupported type for start_index. Expected int or LongTensor, got '{type(start_idx)}'."
-
-    thetas = thetas.reshape(1, 1, 1, -1)
-    angles = indices * thetas
-    sin = torch.sin(angles)
-    cos = torch.cos(angles)
-    q = _theta_shift(q, sin, cos)
-    k = _theta_shift(k, sin, cos)
-
-    return q, k
-
-
-@torch.compile()
-def apply_relative_position_pred_tokens(q, k, start_idx: Union[int, torch.Tensor], thetas: Tensor, tokens_per_block: int) -> Tuple[Tensor, Tensor]:
-    assert q.dim() == 5 and k.dim() == 5
-    indices = torch.arange(q.size(3), device=q.device, dtype=q.dtype).reshape(1, -1)
-    block_steps = torch.arange(q.size(2), device=q.device, dtype=q.dtype).reshape(-1, 1) * tokens_per_block
-    indices = indices + block_steps
-    indices = indices.flatten()
-    # b h t k d -> b h (t k) d
-    q = q.flatten(2, 3)
-    k = k.flatten(2, 3)
-
 
     if isinstance(start_idx, int):
         assert thetas is not None
@@ -477,7 +442,10 @@ class RetNetDecoderLayer(nn.Module):
         d_model = config.num_heads * config.head_dim_v
         # retention block
         self.norm1 = nn.LayerNorm(
-            d_model, eps=config.layer_norm_eps, device=config.device, dtype=config.dtype
+            d_model,
+            eps=config.layer_norm_eps,
+            device=config.device,
+            dtype=config.dtype
         )
         self.retention = MultiScaleRetention(MultiScaleRetention.Config(
             num_heads=config.num_heads,
@@ -491,7 +459,10 @@ class RetNetDecoderLayer(nn.Module):
         ))
         # feedforward block
         self.norm2 = nn.LayerNorm(
-            d_model, eps=config.layer_norm_eps, device=config.device, dtype=config.dtype
+            d_model,
+            eps=config.layer_norm_eps,
+            device=config.device,
+            dtype=config.dtype
         )
         self.linear1 = nn.Linear(d_model, config.dim_feedforward, device=config.device, dtype=config.dtype)
         self.linear2 = nn.Linear(config.dim_feedforward, d_model, device=config.device, dtype=config.dtype)
@@ -515,19 +486,13 @@ class RetNetDecoderLayer(nn.Module):
     def forward_chunkwise(
             self, x: Tensor, start_idx: int, prev_state: Optional[Tensor] = None
     ) -> Tuple[Tensor, Tensor]:
-        def _retention_block(x: Tensor) -> Tuple[Tensor, Tensor]:
-            x, state = self.retention.forward_chunkwise(
-                x, start_idx=start_idx, prev_state=prev_state
-            )
-            return self.dropout(x), state
-
         # retention block
         if self.norm_first:
-            y, state = _retention_block(self.norm1(x))
+            y, state = self.retention.forward_chunkwise(self.norm1(x), start_idx=start_idx, prev_state=prev_state)
             x = x + y
             x = x + self._feedforward_block(self.norm2(x))
         else:
-            y, state = _retention_block(x)
+            y, state = self.retention.forward_chunkwise(x, start_idx=start_idx, prev_state=prev_state)
             x = x + self.norm1(y)
             x = x + self.norm2(self._feedforward_block(x))
 
