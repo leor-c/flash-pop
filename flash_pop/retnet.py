@@ -500,7 +500,7 @@ class RetNetDecoder(nn.Module):
         self.xpos_embedder = XPos(
             layer_config.head_dim_qk,
             device=layer_config.device,
-            dtype=torch.float32,
+            dtype=layer_config.dtype,
         )
         self.layers = nn.ModuleList(self._build_layers(num_layers))
 
