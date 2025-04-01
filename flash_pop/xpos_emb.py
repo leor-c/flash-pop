@@ -47,10 +47,9 @@ def _get_sin_cos(
         thetas: Tensor,
 ) -> tuple[Tensor, Tensor]:
     device, dtype = thetas.device, thetas.dtype
-    indices = torch.arange(seq_len, device=device, dtype=dtype)
+    indices = torch.arange(seq_len, device=device)
 
     if isinstance(start_idx, int):
-        assert thetas is not None
         # Combined (cross + intra chunk):
         indices = start_idx + indices
         indices = indices.reshape(1, -1, 1, 1)

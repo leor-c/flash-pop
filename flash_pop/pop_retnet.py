@@ -153,7 +153,8 @@ class POPDecoderLayer(RetNetDecoderLayer):
             batch_size = x.size(0)
             num_blocks = suffixes.size(0) // batch_size
 
-            assert states.size(1)+1 == num_blocks, f"got {states.size(1)+1} states != {num_blocks} num_blocks"
+            assert states.size(1)+1 == num_blocks, (f"got {states.size(1)+1} states != {num_blocks} num_blocks. "
+                                                    f"make sure there is one additional suffix block.")
 
             if prev_state is None:
                 prev_state = torch.zeros_like(states[:, 0:1])
@@ -164,8 +165,9 @@ class POPDecoderLayer(RetNetDecoderLayer):
                 prev_state=prev_states,
                 xpos_embedder=self.suffixes_xpos_embedder,
             )
+            last_state = states[:, -1].clone()
 
-            return x, states[:, -1], suffixes
+            return x, last_state, suffixes
 
         else:
             return x, states, None
@@ -183,7 +185,7 @@ class POPRetNetDecoder(RetNetDecoder):
         self.suffixes_xpos_embedder = XPos(
             layer_config.head_dim_qk,
             device=layer_config.device,
-            dtype=torch.float32,
+            dtype=layer_config.dtype,
         )
         super().__init__(layer_config, num_layers)
 
