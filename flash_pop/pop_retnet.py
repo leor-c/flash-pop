@@ -174,10 +174,7 @@ class POPDecoderLayer(RetNetDecoderLayer):
             return x, states, None
 
 
-def _get_suffixes_start_indices(x, suffixes, start_index: int, block_size: int):
-    batch_size = x.size(0)
-    num_blocks = suffixes.size(0) // batch_size
-
+def _get_suffixes_start_indices(batch_size, num_blocks, start_index: int, block_size: int):
     start_idx = start_index + torch.arange(num_blocks) * block_size
     start_idx = repeat(start_idx, 'n -> (b n)', b=batch_size)
 
@@ -210,6 +207,14 @@ class POPRetNetDecoder(RetNetDecoder):
             prev_states: Optional[tuple[Tensor, ...]] = (),
             suffixes: Optional[Tensor] = None,
     ) -> tuple[Tensor, list[Tensor]]:
+        """
+
+        :param x: Tensor of shape (batch_size, seq_len, num_heads * dim_v).
+        :param start_idx:
+        :param prev_states:
+        :param suffixes: Tensor of shape (batch_size, num_blocks, sfx_seq_len, num_heads * dim_v).
+        :return:
+        """
         if not prev_states:
             prev_states = [None] * self.num_layers
         elif len(prev_states) != len(self.layers):
@@ -219,7 +224,10 @@ class POPRetNetDecoder(RetNetDecoder):
 
         suffixes_start_indices = None
         if suffixes is not None:
-            suffixes_start_indices = _get_suffixes_start_indices(x, suffixes, start_idx, self.layer_config.block_size)
+            assert suffixes.dim() == 4, f"Got {suffixes.dim()}"
+            suffixes_start_indices = _get_suffixes_start_indices(
+                x.size(0), suffixes.size(1), start_idx, self.layer_config.block_size
+            )
 
         states: list[Tensor] = []
         for layer, prev_state in zip(self.layers, prev_states):
