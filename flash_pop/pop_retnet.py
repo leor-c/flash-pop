@@ -2,51 +2,12 @@ from typing import Optional, Union
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 from einops import rearrange, einsum, repeat
 
 from xpos_emb import XPos
 from retnet import MultiScaleRetention, RetNetDecoderLayer, RetNetDecoder
 from pop_retention import flash_pop_retention
-
-
-# @torch.compile()
-# def apply_relative_position_pred_tokens(
-#         q, k, start_idx: Union[int, torch.Tensor], thetas: Tensor, tokens_per_block: int
-# ) -> tuple[Tensor, Tensor]:
-#     # b num_blocks len h dk
-#     assert q.dim() == 5 and k.dim() == 5
-#     indices = torch.arange(q.size(2), device=q.device, dtype=q.dtype).reshape(1, -1)
-#     block_steps = torch.arange(q.size(1), device=q.device, dtype=q.dtype).reshape(-1, 1) * tokens_per_block
-#     indices = indices + block_steps
-#     indices = indices.flatten()
-#     # b t k h d -> b (t k) h d
-#     # q = q.flatten(1, 2)
-#     # k = k.flatten(1, 2)
-#
-#     if isinstance(start_idx, int):
-#         assert thetas is not None
-#         # Combined (cross + intra chunk):
-#         indices = start_idx + indices
-#         indices = indices.reshape(1, 1, -1, 1)
-#
-#     elif isinstance(start_idx, torch.Tensor):
-#         assert start_idx.dim() == 1
-#         indices = start_idx.view(-1, 1) + indices.view(1, -1)
-#         indices = indices.reshape(indices.shape[0], 1, indices.shape[1], 1)
-#
-#     else:
-#         assert False, f"Unsupported type for start_index. Expected int or LongTensor, got '{type(start_idx)}'."
-#
-#     thetas = thetas.reshape(1, 1, 1, -1)
-#     angles = indices * thetas
-#     sin = torch.sin(angles)
-#     cos = torch.cos(angles)
-#     q = _theta_shift(q, sin, cos)
-#     k = _theta_shift(k, sin, cos)
-#
-#     return q, k
 
 
 class POPMultiScaleRetention(MultiScaleRetention):
@@ -241,6 +202,6 @@ class POPRetNetDecoder(RetNetDecoder):
                 suffixes_start_indices=suffixes_start_indices
             )
             states.append(state)
-        return x, states, suffixes
+        return x, states, rearrange(suffixes, '(b n) t d -> b n t d', b=x.size(0))
 
 
