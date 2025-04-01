@@ -17,6 +17,7 @@ from einops import rearrange, einsum, repeat
 from torch import Tensor
 
 from fused_retention import fused_chunk_retention
+from xpos_emb import XPos
 
 ActivationString = Literal["swish", "gelu", "relu"]
 
@@ -71,66 +72,6 @@ def get_decays(num_heads: int, decay_range: Optional[tuple[float, float]] = None
     else:
         decay_exp = -np.linspace(decay_range[0], decay_range[1], num_heads)
     return 1 - np.exp2(decay_exp)
-
-
-def _build_position_thetas(
-    head_dim: int,
-    scale: float = 10000,
-    device: Optional[Union[torch.device, str]] = None,
-    dtype: Optional[torch.dtype] = None,
-) -> Tensor:
-    """Positional thetas are different for each value along head_dim, following the
-    prescribed method in the paper.  These are used to update the positional
-    embeddings in both the parallel and recurrent formulations of retention.
-    See: https://arxiv.org/pdf/2307.08621v3.pdf, Section 2.1 (Retention)
-
-    NOTE: The actual values for thetas are not specified in the paper, so I
-    copied these values from the official implementation.
-    See: https://github.com/microsoft/torchscale/blob/7d231743f4f96c460b7cf0aa0cf242bb192b34f8/torchscale/architecture/retnet.py#L27C1-L28C59
-    """
-    x = torch.linspace(0, 1, steps=head_dim // 2, device=device, dtype=dtype)
-    thetas = 1 / (scale**x)
-    return repeat(thetas, "d -> (d n)", n=2)
-
-
-@torch.compile()
-def _multiply_by_i(x: Tensor) -> Tensor:
-    """Multiply a complex-valued tensor by the imaginary unit 'i'."""
-    return torch.stack((-x[..., 1::2], x[..., ::2]), dim=-1).flatten(start_dim=-2)
-
-
-@torch.compile()
-def _theta_shift(x: Tensor, sin: Tensor, cos: Tensor) -> Tensor:
-    # TODO: Add docstring
-    return (x * cos) + (_multiply_by_i(x) * sin)
-
-
-@torch.compile()
-def apply_relative_position(q, k, start_idx: Union[int, torch.Tensor], thetas: Tensor) -> Tuple[Tensor, Tensor]:
-    indices = torch.arange(q.size(2), device=q.device, dtype=q.dtype)
-
-    if isinstance(start_idx, int):
-        assert thetas is not None
-        # Combined (cross + intra chunk):
-        indices = start_idx + indices
-        indices = indices.reshape(1, 1, -1, 1)
-
-    elif isinstance(start_idx, torch.Tensor):
-        assert start_idx.dim() == 1
-        indices = start_idx.view(-1, 1) + indices.view(1, -1)
-        indices = indices.reshape(indices.shape[0], 1, indices.shape[1], 1)
-
-    else:
-        assert False, f"Unsupported type for start_index. Expected int or LongTensor, got '{type(start_idx)}'."
-
-    thetas = thetas.reshape(1, 1, 1, -1)
-    angles = indices * thetas
-    sin = torch.sin(angles)
-    cos = torch.cos(angles)
-    q = _theta_shift(q, sin, cos)
-    k = _theta_shift(k, sin, cos)
-
-    return q, k
 
 
 def retention_recurrent(
@@ -194,6 +135,7 @@ class MultiScaleRetention(nn.Module):
     def __init__(
             self,
             config: Config,
+            xpos_embedding: Optional[XPos] = None
     ):
         """"""
         activation = config.activation
@@ -208,6 +150,11 @@ class MultiScaleRetention(nn.Module):
         self.embed_dim = embed_dim
         self.dropout = config.dropout
         self.relative_position = config.relative_position
+        self.xpos_embedding = XPos(
+            self.head_dim_qk,
+            device=config.device,
+            dtype=torch.float32
+        ) if xpos_embedding is None else xpos_embedding
         self.bias = config.bias
         self.activation = activation
         self.head_decays = tuple(get_decays(self.num_heads, config.head_decays_range).tolist())
@@ -252,15 +199,6 @@ class MultiScaleRetention(nn.Module):
         self.out_proj = nn.Linear(
             embed_dim, embed_dim, bias=bias, device=device, dtype=dtype
         )
-
-        # 'thetas' parameter for updating the relative position embeddings.
-        thetas: Optional[Tensor] = None
-        if self.relative_position:
-            thetas = _build_position_thetas(
-                head_dim=self.head_dim_qk, device=device, dtype=dtype
-            )
-        self.thetas: Optional[Tensor]
-        self.register_buffer("thetas", thetas)
 
         self._reset_parameters()
 
@@ -307,8 +245,7 @@ class MultiScaleRetention(nn.Module):
 
         if self.relative_position:
             # global (cross-chunk) + intra-chunk relative position embedding
-            assert self.thetas is not None
-            q, k = apply_relative_position(q, k, start_idx, self.thetas)
+            q, k = self.xpos_embedding(q, k, start_idx)
 
         if prev_state is None:
             batch_size, seq_len, num_heads, dim_v = v.shape
@@ -363,14 +300,7 @@ class MultiScaleRetention(nn.Module):
         v = rearrange(v, "b (h d) -> b h d", h=self.num_heads)
 
         if self.relative_position:
-            assert self.thetas is not None
-            thetas = rearrange(self.thetas, "d -> () () d")
-            angles = seq_idx * thetas
-            sin = torch.sin(angles)
-            cos = torch.cos(angles)
-
-            q = _theta_shift(q, sin, cos)
-            k = _theta_shift(k, sin, cos)
+            q, k = self.xpos_embedding(q, k, seq_idx)
 
         # Apply retention then group norm.
         retention, state = retention_recurrent(q, k, v, self.head_decays_torch, prev_state=prev_state)
@@ -415,6 +345,7 @@ class RetNetDecoderLayer(nn.Module):
     def __init__(
         self,
         config: Config,
+        xpos_embedding: Optional[XPos] = None
     ) -> None:
         """
 
@@ -447,16 +378,19 @@ class RetNetDecoderLayer(nn.Module):
             device=config.device,
             dtype=config.dtype
         )
-        self.retention = MultiScaleRetention(MultiScaleRetention.Config(
-            num_heads=config.num_heads,
-            head_dim_v=config.head_dim_v,
-            head_dim_qk=config.head_dim_qk,
-            dropout=config.dropout,
-            head_decays_range=config.head_decays_range,
-            activation=activation,
-            device=config.device,
-            dtype=config.dtype,
-        ))
+        self.retention = MultiScaleRetention(
+            MultiScaleRetention.Config(
+                num_heads=config.num_heads,
+                head_dim_v=config.head_dim_v,
+                head_dim_qk=config.head_dim_qk,
+                dropout=config.dropout,
+                head_decays_range=config.head_decays_range,
+                activation=activation,
+                device=config.device,
+                dtype=config.dtype,
+            ),
+            xpos_embedding=xpos_embedding,
+        )
         # feedforward block
         self.norm2 = nn.LayerNorm(
             d_model,
@@ -527,8 +461,13 @@ class RetNetDecoder(nn.Module):
     def __init__(self, layer_config: RetNetDecoderLayer.Config, num_layers: int):
         super().__init__()
         self.num_layers = num_layers
+        self.xpos_embedding = XPos(
+            layer_config.head_dim_qk,
+            device=layer_config.device,
+            dtype=torch.float32,
+        )
         self.layers = nn.ModuleList(
-            [RetNetDecoderLayer(layer_config) for _ in range(num_layers)]
+            [RetNetDecoderLayer(layer_config, self.xpos_embedding) for _ in range(num_layers)]
         )
 
     def forward_recurrent(
