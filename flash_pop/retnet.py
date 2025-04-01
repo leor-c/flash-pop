@@ -262,7 +262,7 @@ class MultiScaleRetention(nn.Module):
             if xpos_embedder is None:
                 xpos_embedder = self.xpos_embedder
 
-            q, k = self.xpos_embedder(q, k, start_idx)
+            q, k = xpos_embedder(q, k, start_idx)
 
         if prev_state is None:
             batch_size, seq_len, num_heads, dim_v = v.shape

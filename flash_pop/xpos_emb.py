@@ -74,7 +74,7 @@ def _get_sin_cos(
     return sin, cos
 
 
-class XPos(nn.Module):
+class XPos:
 
     def __init__(
             self,
@@ -83,10 +83,7 @@ class XPos(nn.Module):
             start_idx: Union[int, torch.Tensor] = 0,
             device=None,
             dtype=None,
-            *args,
-            **kwargs
     ) -> None:
-        super().__init__(*args, **kwargs)
         self.cos_cache = None
         self.sin_cache = None
         self.start_idx = start_idx
@@ -116,7 +113,7 @@ class XPos(nn.Module):
             return self.sin_cache[:, start_idx:end_idx], self.cos_cache[:, start_idx:end_idx]
         else:
             assert isinstance(start_idx, torch.Tensor)
-            if start_idx.numel() != self.start_idx.numel() or torch.any(start_idx != self.start_idx):
+            if not isinstance(self.start_idx, Tensor) or start_idx.numel() != self.start_idx.numel() or torch.any(start_idx != self.start_idx):
                 self.sin_cache, self.cos_cache = _get_sin_cos(seq_len, start_idx, self.thetas)
             return self.sin_cache, self.cos_cache
 

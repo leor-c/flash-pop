@@ -139,27 +139,24 @@ class POPDecoderLayer(RetNetDecoderLayer):
         assert x.dim() == 3, f"Got {x.dim()}"  # b t (h d)
 
         if self.norm_first:
-            y, states = self.retention.pop_chunkwise(self.norm1(x), start_idx=start_index, prev_state=prev_state)
+            y, states = self.retention.pop_chunkwise(self.norm1(x), start_index=start_index, prev_state=prev_state)
             x = x + y
             x = x + self._feedforward_block(self.norm2(x))
         else:
-            y, states = self.retention.pop_chunkwise(x, start_idx=start_index, prev_state=prev_state)
+            y, states = self.retention.pop_chunkwise(x, start_index=start_index, prev_state=prev_state)
             x = x + self.norm1(y)
             x = x + self.norm2(self._feedforward_block(x))
 
         if suffixes is not None:
-            assert suffixes_start_indices is not None
+            assert suffixes_start_indices is not None and isinstance(suffixes_start_indices, Tensor)
             assert suffixes.dim() == 3, f"Got {suffixes.dim()}"  # (b n) t (h d) where n=num blocks, t is sfx length
             batch_size = x.size(0)
             num_blocks = suffixes.size(0) // batch_size
 
             assert states.size(1)+1 == num_blocks, f"got {states.size(1)+1} states != {num_blocks} num_blocks"
 
-            start_idx = start_index + torch.arange(num_blocks) * self.config.block_size
-            start_idx = repeat(start_idx, 'n -> (b n)', b=batch_size)
-
             if prev_state is None:
-                prev_state = torch.zeros_like(states[:, 0])
+                prev_state = torch.zeros_like(states[:, 0:1])
             prev_states = torch.cat((prev_state, states), dim=1).flatten(0, 1)
             suffixes, _ = self.retention._retention_chunkwise(
                 suffixes,
@@ -174,8 +171,8 @@ class POPDecoderLayer(RetNetDecoderLayer):
             return x, states, None
 
 
-def _get_suffixes_start_indices(batch_size, num_blocks, start_index: int, block_size: int):
-    start_idx = start_index + torch.arange(num_blocks) * block_size
+def _get_suffixes_start_indices(batch_size, num_blocks, start_index: int, block_size: int, device):
+    start_idx = start_index + torch.arange(num_blocks, device=device) * block_size
     start_idx = repeat(start_idx, 'n -> (b n)', b=batch_size)
 
     return start_idx
@@ -226,8 +223,9 @@ class POPRetNetDecoder(RetNetDecoder):
         if suffixes is not None:
             assert suffixes.dim() == 4, f"Got {suffixes.dim()}"
             suffixes_start_indices = _get_suffixes_start_indices(
-                x.size(0), suffixes.size(1), start_idx, self.layer_config.block_size
+                x.size(0), suffixes.size(1), start_idx, self.layer_config.block_size, x.device
             )
+            suffixes = suffixes.flatten(0, 1)
 
         states: list[Tensor] = []
         for layer, prev_state in zip(self.layers, prev_states):
