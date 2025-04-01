@@ -135,7 +135,7 @@ class MultiScaleRetention(nn.Module):
     def __init__(
             self,
             config: Config,
-            xpos_embedding: Optional[XPos] = None
+            xpos_embedder: Optional[XPos] = None
     ):
         """"""
         activation = config.activation
@@ -150,11 +150,11 @@ class MultiScaleRetention(nn.Module):
         self.embed_dim = embed_dim
         self.dropout = config.dropout
         self.relative_position = config.relative_position
-        self.xpos_embedding = XPos(
+        self.xpos_embedder = XPos(
             self.head_dim_qk,
             device=config.device,
             dtype=torch.float32
-        ) if xpos_embedding is None else xpos_embedding
+        ) if xpos_embedder is None else xpos_embedder
         self.bias = config.bias
         self.activation = activation
         self.head_decays = tuple(get_decays(self.num_heads, config.head_decays_range).tolist())
@@ -221,11 +221,25 @@ class MultiScaleRetention(nn.Module):
         if self.g_proj.bias is not None:
             nn.init.constant_(self.g_proj.bias, 0)
 
-    def forward_chunkwise(
+    def _compute_chunkwise_retention_kernel(
+            self,
+            q: Tensor,
+            k: Tensor,
+            v: Tensor,
+            prev_state: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        retention, state = fused_chunk_retention(
+            q, k, v, prev_state, self.head_decays
+        )
+        return retention, state
+
+    def _retention_chunkwise(
             self,
             x: Tensor,
             start_idx: Union[int, torch.LongTensor],
             prev_state: Optional[Tensor] = None,
+            retention_kernel: Optional[Callable] = None,
+            xpos_embedder: Optional[XPos] = None,
     ) -> Tuple[Tensor, Tensor]:
         # einstein notation:
         # b - batch size
@@ -245,7 +259,10 @@ class MultiScaleRetention(nn.Module):
 
         if self.relative_position:
             # global (cross-chunk) + intra-chunk relative position embedding
-            q, k = self.xpos_embedding(q, k, start_idx)
+            if xpos_embedder is None:
+                xpos_embedder = self.xpos_embedder
+
+            q, k = self.xpos_embedder(q, k, start_idx)
 
         if prev_state is None:
             batch_size, seq_len, num_heads, dim_v = v.shape
@@ -253,8 +270,10 @@ class MultiScaleRetention(nn.Module):
             prev_state = torch.zeros((batch_size, num_heads, dim_qk, dim_v), device=x.device, dtype=x.dtype)
 
         # Apply retention then group norm.
-        retention, state = fused_chunk_retention(
-            q, k, v, prev_state, self.head_decays
+        if retention_kernel is None:
+            retention_kernel = self._compute_chunkwise_retention_kernel
+        retention, state = retention_kernel(
+            q, k, v, prev_state,
         )
         # To apply group norm in an equivalent way to the recurrent formulation,
         # we fold the sequence dimension into the batch dimension.  Otherwise,
@@ -278,6 +297,18 @@ class MultiScaleRetention(nn.Module):
 
         return retention, state
 
+    def forward_chunkwise(
+            self,
+            x: Tensor,
+            start_idx: Union[int, torch.LongTensor],
+            prev_state: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        return self._retention_chunkwise(
+            x,
+            start_idx,
+            prev_state,
+        )
+
     def forward_recurrent(
             self,
             x: Tensor,
@@ -300,7 +331,7 @@ class MultiScaleRetention(nn.Module):
         v = rearrange(v, "b (h d) -> b h d", h=self.num_heads)
 
         if self.relative_position:
-            q, k = self.xpos_embedding(q, k, seq_idx)
+            q, k = self.xpos_embedder(q, k, seq_idx)
 
         # Apply retention then group norm.
         retention, state = retention_recurrent(q, k, v, self.head_decays_torch, prev_state=prev_state)
@@ -345,7 +376,7 @@ class RetNetDecoderLayer(nn.Module):
     def __init__(
         self,
         config: Config,
-        xpos_embedding: Optional[XPos] = None
+        xpos_embedder: Optional[XPos] = None
     ) -> None:
         """
 
@@ -362,6 +393,7 @@ class RetNetDecoderLayer(nn.Module):
         :param device:
         :param dtype:
         """
+        self.config = config
         activation = config.activation
         if isinstance(config.activation, str):
             activation = _get_activation_fn(config.activation)
@@ -378,19 +410,7 @@ class RetNetDecoderLayer(nn.Module):
             device=config.device,
             dtype=config.dtype
         )
-        self.retention = MultiScaleRetention(
-            MultiScaleRetention.Config(
-                num_heads=config.num_heads,
-                head_dim_v=config.head_dim_v,
-                head_dim_qk=config.head_dim_qk,
-                dropout=config.dropout,
-                head_decays_range=config.head_decays_range,
-                activation=activation,
-                device=config.device,
-                dtype=config.dtype,
-            ),
-            xpos_embedding=xpos_embedding,
-        )
+        self.retention = self._build_multi_scale_retention(xpos_embedder=xpos_embedder)
         # feedforward block
         self.norm2 = nn.LayerNorm(
             d_model,
@@ -402,6 +422,21 @@ class RetNetDecoderLayer(nn.Module):
         self.linear2 = nn.Linear(config.dim_feedforward, d_model, device=config.device, dtype=config.dtype)
 
         self._reset_parameters()
+
+    def _build_multi_scale_retention(self, xpos_embedder: Optional[XPos] = None):
+        return MultiScaleRetention(
+            MultiScaleRetention.Config(
+                num_heads=self.config.num_heads,
+                head_dim_v=self.config.head_dim_v,
+                head_dim_qk=self.config.head_dim_qk,
+                dropout=self.config.dropout,
+                head_decays_range=self.config.head_decays_range,
+                activation=self.activation,
+                device=self.config.device,
+                dtype=self.config.dtype,
+            ),
+            xpos_embedder=xpos_embedder,
+        )
 
     def _reset_parameters(self):
         # TODO: Check that we're following the same initialization as the paper
@@ -460,15 +495,17 @@ class RetNetDecoderLayer(nn.Module):
 class RetNetDecoder(nn.Module):
     def __init__(self, layer_config: RetNetDecoderLayer.Config, num_layers: int):
         super().__init__()
+        self.layer_config = layer_config
         self.num_layers = num_layers
-        self.xpos_embedding = XPos(
+        self.xpos_embedder = XPos(
             layer_config.head_dim_qk,
             device=layer_config.device,
             dtype=torch.float32,
         )
-        self.layers = nn.ModuleList(
-            [RetNetDecoderLayer(layer_config, self.xpos_embedding) for _ in range(num_layers)]
-        )
+        self.layers = nn.ModuleList(self._build_layers(num_layers))
+
+    def _build_layers(self, num_layers: int):
+        return [RetNetDecoderLayer(self.layer_config, self.xpos_embedder) for _ in range(num_layers)]
 
     def forward_recurrent(
             self, x: Tensor, seq_idx: int, prev_states: Sequence[Optional[Tensor]] = ()

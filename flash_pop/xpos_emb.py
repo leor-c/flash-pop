@@ -37,7 +37,6 @@ def _multiply_by_i(x: Tensor) -> Tensor:
 
 @torch.compile()
 def _theta_shift(x: Tensor, sin: Tensor, cos: Tensor) -> Tensor:
-    # TODO: Add docstring
     return (x * cos) + (_multiply_by_i(x) * sin)
 
 
