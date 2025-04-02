@@ -16,7 +16,7 @@ import torch._dynamo
 from einops import rearrange, einsum, repeat
 from torch import Tensor
 
-from fused_retention import fused_chunk_retention
+from flash_pop.fused_retention import fused_chunk_retention
 from xpos_emb import XPos
 
 ActivationString = Literal["swish", "gelu", "relu"]

@@ -5,9 +5,9 @@ import torch
 from torch import Tensor
 from einops import rearrange, einsum, repeat
 
-from xpos_emb import XPos
-from retnet import MultiScaleRetention, RetNetDecoderLayer, RetNetDecoder
-from pop_retention import flash_pop_retention
+from flash_pop.xpos_emb import XPos
+from flash_pop.retnet import MultiScaleRetention, RetNetDecoderLayer, RetNetDecoder
+from flash_pop.pop_retention import flash_pop_retention
 
 
 class POPMultiScaleRetention(MultiScaleRetention):

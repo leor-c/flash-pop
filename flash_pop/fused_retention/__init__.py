@@ -4,7 +4,7 @@ from einops import rearrange
 
 from .fused_chunk_fwd import fused_chunk_retention_fwd
 from .fused_chunk_bwd import fused_retention_bwd_dk_dv_ds, fused_retention_bwd_dq
-from utils import cached
+from flash_pop.utils import cached
 
 
 class FusedChunkRetention(torch.autograd.Function):

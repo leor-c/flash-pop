@@ -1,7 +1,7 @@
 import tilelang
 import tilelang.language as T
 
-from fused_retention.fused_chunk_fwd import chunk_outputs_macro, chunk_state_update_macro
+from flash_pop.fused_retention.fused_chunk_fwd import chunk_outputs_macro, chunk_state_update_macro
 
 
 def fused_pop_retention_fwd(batch, heads, seq_len, block_size, dim_qk, dim_v, BK, BV, BT, threads=64, dtype="bfloat16"):
