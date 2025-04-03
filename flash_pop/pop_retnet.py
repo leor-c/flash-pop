@@ -166,7 +166,7 @@ class POPRetNetDecoder(RetNetDecoder):
             start_idx: int = 0,
             prev_states: Optional[tuple[Tensor, ...]] = (),
             suffixes: Optional[Tensor] = None,
-    ) -> tuple[Tensor, list[Tensor]]:
+    ) -> tuple[Tensor, Tensor, Optional[Tensor]]:
         """
 
         :param x: Tensor of shape (batch_size, seq_len, num_heads * dim_v).
@@ -175,7 +175,7 @@ class POPRetNetDecoder(RetNetDecoder):
         :param suffixes: Tensor of shape (batch_size, num_blocks, sfx_seq_len, num_heads * dim_v).
         :return:
         """
-        if not prev_states:
+        if prev_states is None or len(prev_states) == 0:
             prev_states = [None] * self.num_layers
         elif len(prev_states) != len(self.layers):
             raise ValueError(
@@ -204,6 +204,6 @@ class POPRetNetDecoder(RetNetDecoder):
             states.append(state)
         if suffixes is not None:
             suffixes = rearrange(suffixes, '(b n) t d -> b n t d', b=x.size(0))
-        return x, states, suffixes
+        return x, torch.stack(states), suffixes
 
 

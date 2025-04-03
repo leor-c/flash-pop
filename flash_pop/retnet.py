@@ -509,8 +509,8 @@ class RetNetDecoder(nn.Module):
 
     def forward_recurrent(
             self, x: Tensor, seq_idx: int, prev_states: Sequence[Optional[Tensor]] = ()
-    ) -> Tuple[Tensor, List[Tensor]]:
-        if not prev_states:
+    ) -> Tuple[Tensor, Tensor]:
+        if prev_states is None or len(prev_states) == 0:
             prev_states = [None] * self.num_layers
         elif len(prev_states) != len(self.layers):
             raise ValueError(
@@ -522,12 +522,12 @@ class RetNetDecoder(nn.Module):
             assert isinstance(layer, RetNetDecoderLayer)
             x, state = layer.forward_recurrent(x, seq_idx, prev_state)
             states.append(state)
-        return x, states
+        return x, torch.stack(states)
 
     def forward_chunkwise(
             self, x: Tensor, start_idx: int = 0, prev_states: Sequence[Optional[Tensor]] = ()
-    ) -> Tuple[Tensor, List[Tensor]]:
-        if not prev_states:
+    ) -> Tuple[Tensor, Tensor]:
+        if prev_states is None or len(prev_states) == 0:
             prev_states = [None] * self.num_layers
         elif len(prev_states) != len(self.layers):
             raise ValueError(
@@ -539,7 +539,7 @@ class RetNetDecoder(nn.Module):
             assert isinstance(layer, RetNetDecoderLayer)
             x, state = layer.forward_chunkwise(x, start_idx, prev_state)
             states.append(state)
-        return x, states
+        return x, torch.stack(states)
 
-    def forward(self, x: Tensor) -> Tuple[Tensor, List[Tensor]]:
+    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
         return self.forward_chunkwise(x)
