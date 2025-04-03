@@ -105,9 +105,9 @@ class XPos:
 
     def get_sin_cos(self, seq_len, start_idx):
         if isinstance(start_idx, int):
-            if seq_len > self.seq_len:
-                self.seq_len = seq_len
-                self.sin_cache, self.cos_cache = _get_sin_cos(seq_len, start_idx, self.thetas)
+            if start_idx + seq_len > self.seq_len:
+                self.seq_len = start_idx + seq_len
+                self.sin_cache, self.cos_cache = _get_sin_cos(self.seq_len, 0, self.thetas)
             end_idx = start_idx + seq_len
             return self.sin_cache[:, start_idx:end_idx], self.cos_cache[:, start_idx:end_idx]
         else:
