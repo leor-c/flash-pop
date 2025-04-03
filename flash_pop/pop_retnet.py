@@ -202,6 +202,8 @@ class POPRetNetDecoder(RetNetDecoder):
                 suffixes_start_indices=suffixes_start_indices
             )
             states.append(state)
-        return x, states, rearrange(suffixes, '(b n) t d -> b n t d', b=x.size(0))
+        if suffixes is not None:
+            suffixes = rearrange(suffixes, '(b n) t d -> b n t d', b=x.size(0))
+        return x, states, suffixes
 
 
