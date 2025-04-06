@@ -24,9 +24,9 @@ def _build_position_thetas(
     copied these values from the official implementation.
     See: https://github.com/microsoft/torchscale/blob/7d231743f4f96c460b7cf0aa0cf242bb192b34f8/torchscale/architecture/retnet.py#L27C1-L28C59
     """
-    x = torch.linspace(0, 1, steps=head_dim // 2, device=device, dtype=dtype)
+    x = torch.linspace(0, 1, steps=head_dim // 2, device=device)
     thetas = 1 / (scale**x)
-    return repeat(thetas, "d -> (d n)", n=2)
+    return repeat(thetas.to(dtype=dtype), "d -> (d n)", n=2)
 
 
 @torch.compile()
@@ -66,9 +66,9 @@ def _get_sin_cos(
         assert False, f"Unsupported type for start_index. Expected int or LongTensor, got '{type(start_idx)}'."
 
     thetas = thetas.reshape(1, 1, 1, -1)
-    angles = indices * thetas
-    sin = torch.sin(angles)
-    cos = torch.cos(angles)
+    angles = indices * thetas.float()
+    sin = torch.sin(angles).to(dtype=dtype)
+    cos = torch.cos(angles).to(dtype=dtype)
 
     return sin, cos
 
@@ -114,6 +114,7 @@ class XPos:
             assert isinstance(start_idx, torch.Tensor)
             if not isinstance(self.start_idx, Tensor) or start_idx.numel() != self.start_idx.numel() or torch.any(start_idx != self.start_idx):
                 self.sin_cache, self.cos_cache = _get_sin_cos(seq_len, start_idx, self.thetas)
+                self.start_idx = start_idx
             return self.sin_cache, self.cos_cache
 
     def __call__(self, q, k, start_idx: Union[int, torch.Tensor], *args, **kwargs):

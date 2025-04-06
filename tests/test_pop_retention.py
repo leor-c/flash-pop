@@ -5,9 +5,9 @@ import torch
 from tilelang.profiler import do_bench
 from loguru import logger
 
-from fused_retention.reference import ref_program_
-from pop_retention import flash_pop_retention
-from test_fused_retention import Config as RetNetConfig, generate_inputs, get_err_ratio, log_error_info, detail_level
+from flash_pop.fused_retention.reference import ref_program_
+from flash_pop.pop_retention import flash_pop_retention
+from tests.test_fused_retention import Config as RetNetConfig, generate_inputs, get_err_ratio, log_error_info, detail_level
 
 
 def ref_pop(Q, K, V, prev_state, head_decays, block_size: int = 512, *args):

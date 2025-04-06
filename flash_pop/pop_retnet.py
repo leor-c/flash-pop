@@ -109,29 +109,55 @@ class POPDecoderLayer(RetNetDecoderLayer):
             x = x + self.norm2(self._feedforward_block(x))
 
         if suffixes is not None:
-            assert suffixes_start_indices is not None and isinstance(suffixes_start_indices, Tensor)
-            assert suffixes.dim() == 3, f"Got {suffixes.dim()}"  # (b n) t (h d) where n=num blocks, t is sfx length
-            batch_size = x.size(0)
-            num_blocks = suffixes.size(0) // batch_size
-
-            assert states.size(1)+1 == num_blocks, (f"got {states.size(1)+1} states != {num_blocks} num_blocks. "
-                                                    f"make sure there is one additional suffix block.")
-
-            if prev_state is None:
-                prev_state = torch.zeros_like(states[:, 0:1])
-            prev_states = torch.cat((prev_state, states), dim=1).flatten(0, 1)
-            suffixes, _ = self.retention._retention_chunkwise(
-                suffixes,
-                start_idx=suffixes_start_indices,
-                prev_state=prev_states,
-                xpos_embedder=self.suffixes_xpos_embedder,
-            )
-            last_state = states[:, -1].clone()
+            if self.norm_first:
+                suffixes_y, last_state = self._suffixes_forward(
+                    self.norm1(suffixes),
+                    suffixes_start_indices,
+                    prev_state,
+                    states,
+                    x.size(0),
+                    self.suffixes_xpos_embedder
+                )
+                suffixes = suffixes + suffixes_y
+                suffixes = suffixes + self._feedforward_block(self.norm2(suffixes))
+            else:
+                suffixes_y, last_state = self._suffixes_forward(
+                    suffixes,
+                    suffixes_start_indices,
+                    prev_state,
+                    states,
+                    x.size(0),
+                    self.suffixes_xpos_embedder
+                )
+                suffixes = suffixes + self.norm1(suffixes_y)
+                suffixes = suffixes + self.norm2(self._feedforward_block(suffixes))
 
             return x, last_state, suffixes
 
         else:
             return x, states, None
+
+    def _suffixes_forward(self, suffixes, start_indices, prev_state, states, batch_size, xpos_embedder=None):
+        assert start_indices is not None and isinstance(start_indices, Tensor)
+        assert suffixes.dim() == 3, f"Got {suffixes.dim()}"  # (b n) t (h d) where n=num blocks, t is sfx length
+        num_blocks = suffixes.size(0) // batch_size
+
+        assert states.size(1) + 1 == num_blocks, (f"got {states.size(1) + 1} states != {num_blocks} num_blocks. "
+                                                  f"make sure there is one additional suffix block.")
+
+        if prev_state is None:
+            prev_state = torch.zeros_like(states[:, 0:1])
+        prev_states = torch.cat((prev_state, states), dim=1).flatten(0, 1)
+        suffixes, _ = self.retention._retention_chunkwise(
+            suffixes,
+            start_idx=start_indices,
+            prev_state=prev_states,
+            xpos_embedder=self.suffixes_xpos_embedder,
+        )
+        last_state = states[:, -1].clone()
+
+        return suffixes, last_state
+
 
 
 def _get_suffixes_start_indices(batch_size, num_blocks, start_index: int, block_size: int, device):
