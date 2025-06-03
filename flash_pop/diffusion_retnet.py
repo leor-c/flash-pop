@@ -19,8 +19,8 @@ from torch import Tensor
 from flash_pop.fused_retention import fused_chunk_retention
 from flash_pop.xpos_emb import XPos
 from flash_pop.retnet import ActivationString, _get_activation_fn, MultiScaleRetention
-from modules.adaln import AdaLayerNorm, AdaLayerNormZero
-from modules.timestep import TimestepEmbedder
+from flash_pop.modules.adaln import AdaLayerNorm, AdaLayerNormZero
+from flash_pop.modules.timestep import TimestepEmbedder
 
 
 class DiffusionRetNetDecoderLayer(nn.Module):
@@ -172,23 +172,21 @@ class DiffusionRetNetDecoder(nn.Module):
         super().__init__()
         layer_config = config.layer_config
         self.layer_config = config.layer_config
+        device = layer_config.device
+        dtype = layer_config.dtype
         self.num_layers = config.num_layers
-        self.xpos_embedder = XPos(
-            layer_config.head_dim_qk,
-            device=layer_config.device,
-            dtype=layer_config.dtype,
-        )
+        self.xpos_embedder = XPos(layer_config.head_dim_qk, device=device, dtype=dtype)
         d_model = layer_config.head_dim_v * layer_config.num_heads
-        self.t_embedder = TimestepEmbedder(d_model)
+        self.t_embedder = TimestepEmbedder(d_model, device=device, dtype=dtype)
         self.layers = nn.ModuleList(self._build_layers(config.num_layers))
         self.final_ada_ln = AdaLayerNorm(
             d_model,
             eps=layer_config.layer_norm_eps,
             lora_hidden_dim=layer_config.ada_ln_lora_dim,
-            device=layer_config.device,
-            dtype=layer_config.dtype,
+            device=device,
+            dtype=dtype,
         )
-        self.final_linear = nn.Linear(d_model, config.out_dim)
+        self.final_linear = nn.Linear(d_model, config.out_dim, device=device, dtype=dtype)
 
     def _build_layers(self, num_layers: int):
         return [DiffusionRetNetDecoderLayer(self.layer_config, self.xpos_embedder) for _ in range(num_layers)]

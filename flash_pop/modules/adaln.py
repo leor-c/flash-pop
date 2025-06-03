@@ -12,24 +12,24 @@ Adapted implementation to support LoRA as in Cosmos (Nvidia)
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
     assert (
-        x.dim() == shift.dim() == scale.dim()
-    ), f"Got x: {x.dim()}, shift: {shift.dim()}, scale: {scale.dim()}"
+        x.shape == shift.shape == scale.shape
+    ), f"Got x: {x.shape}, shift: {shift.shape}, scale: {scale.shape}"
     return x * (1 + scale) + shift
 
 
-def apply_modulation(x, modulation_op):
-    assert x.dim() == 3, f"Expected x to have 3 dims, got {x.dim()}"
-    if c.dim() == 3 and x.size(1) != c.size(1):
+def apply_modulation(c, modulation_op, x_shape):
+    assert len(x_shape) == 3, f"Expected x to have 3 dims, got {len(x_shape)}"
+    if c.dim() == 3 and x_shape[1] != c.size(1):
         # For per-frame time step, where frames are fixed length sequences
-        assert x.size(1) % c.size(1) == 0, f"Got incompatible shapes: {x.shape}, {c.shape}"
-        multiplier = x.size(1) // c.size(1)
-        c = modulation_op(c.unsqueeze(2)).expand(c.size(0), c.size(1), multiplier, c.size(2)).flatten(1, 2)
+        assert x_shape[1] % c.size(1) == 0, f"Got incompatible shapes: {x_shape}, {c.shape}"
+        multiplier = x_shape[1] // c.size(1)
+        c = modulation_op(c.unsqueeze(2)).expand(c.size(0), c.size(1), multiplier, -1).flatten(1, 2)
 
-    elif c.dim() != x.dim():
+    elif c.dim() != len(x_shape):
         assert c.dim() == 2, f"Got c.dim={c.dim()} != 2"
-        c = modulation_op(c.unsqueeze(1))
+        c = modulation_op(c.unsqueeze(1)).expand(c.size(0), x_shape[1], -1)
     else:
-        assert c.shape == x.shape, f"Shape mismatch: {c.shape}!={x.shape}"
+        assert c.shape == x_shape, f"Shape mismatch: {c.shape}!={x_shape}"
         c = modulation_op(c)
 
     return c
@@ -94,7 +94,7 @@ class AdaLayerNorm(nn.Module):
             x: Input tensor of shape (B, T, D).
             c: Conditioning tensor of shape (B, D) or (B, T, D).
         """
-        apply_modulation(c, self.modulation)
+        c = apply_modulation(c, self.modulation, x.shape)
         shift, scale = c.chunk(2, dim=-1)
         return modulate(self.norm(x.float()).to(dtype=x.dtype), shift, scale)
 
@@ -161,6 +161,6 @@ class AdaLayerNormZero(nn.Module):
             c: Conditioning tensor of shape (B, D) or (B, T', D). Either T=T'
              or T = T' * K
         """
-        apply_modulation(c, self.modulation)
-        shift, scale, gate = c.chunk(3, dim=-1)
+        c = apply_modulation(c, self.modulation, x.shape)
+        shift, scale, gate = c.chunk(3, dim=2)
         return modulate(self.norm(x.float()).to(dtype=x.dtype), shift, scale), gate
