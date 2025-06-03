@@ -89,7 +89,7 @@ class XPos:
 
         # 'thetas' parameter for updating the relative position embeddings.
         self.thetas = _build_position_thetas(
-            head_dim=head_dim_qk, device=device, dtype=dtype
+            head_dim=head_dim_qk, device=device, dtype=torch.float32
         )
         # self.register_buffer("thetas", self.thetas)
 
@@ -120,8 +120,8 @@ class XPos:
     def __call__(self, q, k, start_idx: Union[int, torch.Tensor], *args, **kwargs):
         dtype = q.dtype
         sin, cos = self.get_sin_cos(seq_len=q.size(1), start_idx=start_idx)
-        q = _theta_shift(q, sin, cos).to(dtype=dtype)
-        k = _theta_shift(k, sin, cos).to(dtype=dtype)
+        q = _theta_shift(q.float(), sin, cos).to(dtype=dtype)
+        k = _theta_shift(k.float(), sin, cos).to(dtype=dtype)
 
         return q, k
 

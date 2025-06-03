@@ -175,14 +175,15 @@ class MultiScaleRetention(nn.Module):
         bias = config.bias
 
         # The q/k/v projection layers are the same as in vanilla MHA.
+        lin_dtype = dtype
         self.q_proj = nn.Linear(
-            embed_dim, self.num_heads * self.head_dim_qk, bias=bias, device=device, dtype=dtype
+            embed_dim, self.num_heads * self.head_dim_qk, bias=bias, device=device, dtype=lin_dtype
         )
         self.k_proj = nn.Linear(
-            embed_dim, self.num_heads * self.head_dim_qk, bias=bias, device=device, dtype=dtype
+            embed_dim, self.num_heads * self.head_dim_qk, bias=bias, device=device, dtype=lin_dtype
         )
         self.v_proj = nn.Linear(
-            embed_dim, embed_dim, bias=bias, device=device, dtype=dtype
+            embed_dim, embed_dim, bias=bias, device=device, dtype=lin_dtype
         )
         self.group_norm = nn.GroupNorm(
             num_groups=self.num_heads,
@@ -190,14 +191,14 @@ class MultiScaleRetention(nn.Module):
             affine=False,
             eps=config.group_norm_eps,
             device=config.device,
-            dtype=config.dtype,
+            dtype=torch.float32,
         )
         # The output project is slightly different, due to the gated "swish" layer.
         self.g_proj = nn.Linear(
-            embed_dim, embed_dim, bias=bias, device=device, dtype=dtype
+            embed_dim, embed_dim, bias=bias, device=device, dtype=lin_dtype
         )
         self.out_proj = nn.Linear(
-            embed_dim, embed_dim, bias=bias, device=device, dtype=dtype
+            embed_dim, embed_dim, bias=bias, device=device, dtype=lin_dtype
         )
 
         self._reset_parameters()
@@ -248,9 +249,9 @@ class MultiScaleRetention(nn.Module):
         # d - head dimension
         #
         # Input shape: (b, n, dim_v)
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        q = self.q_proj(x).to(dtype=x.dtype)
+        k = self.k_proj(x).to(dtype=x.dtype)
+        v = self.v_proj(x).to(dtype=x.dtype)
 
         # Unfold 'd' dimension into 'h' separate retention heads.
         q = rearrange(q, "b n (h d) -> b n h d", h=self.num_heads)
@@ -273,15 +274,16 @@ class MultiScaleRetention(nn.Module):
         if retention_kernel is None:
             retention_kernel = self._compute_chunkwise_retention_kernel
         retention, state = retention_kernel(
-            q, k, v, prev_state,
+            q.bfloat16(), k.bfloat16(), v.bfloat16(), prev_state.bfloat16(),
         )
+        retention, state = retention.to(dtype=x.dtype), state.to(dtype=x.dtype)
         # To apply group norm in an equivalent way to the recurrent formulation,
         # we fold the sequence dimension into the batch dimension.  Otherwise,
         # normalization would be applied over the entire input sequence.
         batch_size = retention.size(0)
         retention = rearrange(retention, "b n h d -> (b n) (h d)")
         retention = F.dropout(retention, p=self.dropout, training=self.training)
-        retention = self.group_norm(retention)
+        retention = self.group_norm(retention.float()).to(dtype=x.dtype)
         # Unfold 'n' from the batch dimension, and fold 'h' back into the embed dim.
         retention = rearrange(retention, "(b n) e -> b n e", b=batch_size)
 
@@ -293,7 +295,7 @@ class MultiScaleRetention(nn.Module):
         #   g = swish(X * W_g)
         # where X is the input to the layer.
         gate = self.activation(self.g_proj(x))
-        retention = self.out_proj(retention * gate)
+        retention = self.out_proj((retention * gate)).to(dtype=x.dtype)
 
         return retention, state
 
@@ -338,7 +340,7 @@ class MultiScaleRetention(nn.Module):
         retention = F.dropout(retention, p=self.dropout, training=self.training)
         # Fold heads back into the embedding dimension.
         retention = rearrange(retention, "b h d -> b (h d)")
-        retention = self.group_norm(retention)
+        retention = self.group_norm(retention.float()).to(dtype=x.dtype)
 
         # NOTE: Unlike multihead attention, the retention paper applies a "swish"
         # gate to increase the non-linear capacity of the model.  (IMO this is likely
@@ -408,7 +410,7 @@ class RetNetDecoderLayer(nn.Module):
             d_model,
             eps=config.layer_norm_eps,
             device=config.device,
-            dtype=config.dtype
+            dtype=torch.float32  # crucial for maintaining numerical precision!
         )
         self.retention = self._build_multi_scale_retention(xpos_embedder=xpos_embedder)
         # feedforward block
@@ -416,7 +418,7 @@ class RetNetDecoderLayer(nn.Module):
             d_model,
             eps=config.layer_norm_eps,
             device=config.device,
-            dtype=config.dtype
+            dtype=torch.float32  # crucial for maintaining numerical precision!
         )
         self.linear1 = nn.Linear(d_model, config.dim_feedforward, device=config.device, dtype=config.dtype)
         self.linear2 = nn.Linear(config.dim_feedforward, d_model, device=config.device, dtype=config.dtype)
@@ -456,14 +458,17 @@ class RetNetDecoderLayer(nn.Module):
             self, x: Tensor, start_idx: int, prev_state: Optional[Tensor] = None
     ) -> Tuple[Tensor, Tensor]:
         # retention block
+        dtype = self.config.dtype
         if self.norm_first:
-            y, state = self.retention.forward_chunkwise(self.norm1(x), start_idx=start_idx, prev_state=prev_state)
+            y, state = self.retention.forward_chunkwise(self.norm1(x.float()).to(dtype=dtype), start_idx=start_idx, prev_state=prev_state)
+            y = self.dropout(y)
             x = x + y
-            x = x + self._feedforward_block(self.norm2(x))
+            x = x + self._feedforward_block(self.norm2(x.float()).to(dtype=dtype))
         else:
             y, state = self.retention.forward_chunkwise(x, start_idx=start_idx, prev_state=prev_state)
-            x = x + self.norm1(y)
-            x = x + self.norm2(self._feedforward_block(x))
+            y = self.dropout(y)
+            x = x + self.norm1(y.float()).to(dtype=dtype)
+            x = x + self.norm2(self._feedforward_block(x).float()).to(dtype=dtype)
 
         return x, state
 

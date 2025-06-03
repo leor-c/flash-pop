@@ -8,6 +8,7 @@ from einops import rearrange, einsum, repeat
 from flash_pop.xpos_emb import XPos
 from flash_pop.retnet import MultiScaleRetention, RetNetDecoderLayer, RetNetDecoder
 from flash_pop.pop_retention import flash_pop_retention
+from loguru import logger
 
 
 class POPMultiScaleRetention(MultiScaleRetention):
@@ -27,8 +28,9 @@ class POPMultiScaleRetention(MultiScaleRetention):
             prev_state: Tensor,
     ) -> tuple[Tensor, Tensor]:
         retention, states = flash_pop_retention(
-            q, k, v, prev_state, self.head_decays, self.config.block_size
+            q.bfloat16(), k.bfloat16(), v.bfloat16(), prev_state.bfloat16(), self.head_decays, self.config.block_size
         )
+        retention, states = retention.to(dtype=v.dtype), states.to(dtype=v.dtype)
         return retention, states
 
     def pop_chunkwise(
@@ -98,28 +100,32 @@ class POPDecoderLayer(RetNetDecoderLayer):
         the retention outputs of `x` and the states are returned.
         """
         assert x.dim() == 3, f"Got {x.dim()}"  # b t (h d)
+        dtype = self.config.dtype
 
         if self.norm_first:
-            y, states = self.retention.pop_chunkwise(self.norm1(x), start_index=start_index, prev_state=prev_state)
+            y, states = self.retention.pop_chunkwise(self.norm1(x.float()).to(dtype=dtype), start_index=start_index, prev_state=prev_state)
+            y = self.dropout(y)
             x = x + y
-            x = x + self._feedforward_block(self.norm2(x))
+            x = x + self._feedforward_block(self.norm2(x.float()).to(dtype=dtype))
         else:
             y, states = self.retention.pop_chunkwise(x, start_index=start_index, prev_state=prev_state)
-            x = x + self.norm1(y)
-            x = x + self.norm2(self._feedforward_block(x))
+            y = self.dropout(y)
+            x = x + self.norm1(y.float()).to(dtype=dtype)
+            x = x + self.norm2(self._feedforward_block(x).float()).to(dtype=dtype)
 
         if suffixes is not None:
             if self.norm_first:
                 suffixes_y, last_state = self._suffixes_forward(
-                    self.norm1(suffixes),
+                    self.norm1(suffixes.float()).to(dtype=dtype),
                     suffixes_start_indices,
                     prev_state,
                     states,
                     x.size(0),
                     self.suffixes_xpos_embedder
                 )
+                suffixes_y = self.dropout(suffixes_y)
                 suffixes = suffixes + suffixes_y
-                suffixes = suffixes + self._feedforward_block(self.norm2(suffixes))
+                suffixes = suffixes + self._feedforward_block(self.norm2(suffixes.float()).to(dtype=dtype))
             else:
                 suffixes_y, last_state = self._suffixes_forward(
                     suffixes,
@@ -129,8 +135,9 @@ class POPDecoderLayer(RetNetDecoderLayer):
                     x.size(0),
                     self.suffixes_xpos_embedder
                 )
-                suffixes = suffixes + self.norm1(suffixes_y)
-                suffixes = suffixes + self.norm2(self._feedforward_block(suffixes))
+                suffixes_y = self.dropout(suffixes_y)
+                suffixes = suffixes + self.norm1(suffixes_y.float()).to(dtype=dtype)
+                suffixes = suffixes + self.norm2(self._feedforward_block(suffixes).float()).to(dtype=dtype)
 
             return x, last_state, suffixes
 
