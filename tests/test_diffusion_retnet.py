@@ -69,12 +69,14 @@ def test_retnet(cfg: TestConfig):
 
     # test case: t shape = x shape
     t = torch.randn(cfg.batch_size, cfg.seq_len, device=device, dtype=torch.bfloat16)
+    run = partial(retnet, x=x, diffusion_times=t)
     with torch.no_grad():
         latency = do_bench(run, warmup=100, rep=100)
     print(f"RetNet latency (ms): {latency}")
 
     # test case: single t per batch sample
     t = torch.randn(cfg.batch_size, device=device, dtype=torch.bfloat16)
+    run = partial(retnet, x=x, diffusion_times=t)
     with torch.no_grad():
         latency = do_bench(run, warmup=100, rep=100)
     print(f"RetNet latency (ms): {latency}")
