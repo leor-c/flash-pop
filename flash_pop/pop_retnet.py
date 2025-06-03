@@ -104,12 +104,14 @@ class POPDecoderLayer(RetNetDecoderLayer):
 
         if self.norm_first:
             y, states = self.retention.pop_chunkwise(self.norm1(x.float()).to(dtype=dtype), start_index=start_index, prev_state=prev_state)
-            y = self.dropout(y)
+            if self.config.use_post_retention_dropout:
+                y = self.dropout(y)
             x = x + y
             x = x + self._feedforward_block(self.norm2(x.float()).to(dtype=dtype))
         else:
             y, states = self.retention.pop_chunkwise(x, start_index=start_index, prev_state=prev_state)
-            y = self.dropout(y)
+            if self.config.use_post_retention_dropout:
+                y = self.dropout(y)
             x = x + self.norm1(y.float()).to(dtype=dtype)
             x = x + self.norm2(self._feedforward_block(x).float()).to(dtype=dtype)
 
@@ -123,7 +125,8 @@ class POPDecoderLayer(RetNetDecoderLayer):
                     x.size(0),
                     self.suffixes_xpos_embedder
                 )
-                suffixes_y = self.dropout(suffixes_y)
+                if self.config.use_post_retention_dropout:
+                    suffixes_y = self.dropout(suffixes_y)
                 suffixes = suffixes + suffixes_y
                 suffixes = suffixes + self._feedforward_block(self.norm2(suffixes.float()).to(dtype=dtype))
             else:
@@ -135,7 +138,8 @@ class POPDecoderLayer(RetNetDecoderLayer):
                     x.size(0),
                     self.suffixes_xpos_embedder
                 )
-                suffixes_y = self.dropout(suffixes_y)
+                if self.config.use_post_retention_dropout:
+                    suffixes_y = self.dropout(suffixes_y)
                 suffixes = suffixes + self.norm1(suffixes_y.float()).to(dtype=dtype)
                 suffixes = suffixes + self.norm2(self._feedforward_block(suffixes).float()).to(dtype=dtype)
 

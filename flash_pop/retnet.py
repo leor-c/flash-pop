@@ -368,6 +368,7 @@ class RetNetDecoderLayer(nn.Module):
         head_dim_qk: int = None
         dim_feedforward: int = 2048
         dropout: float = 0.1
+        use_post_retention_dropout: bool = True
         head_decays_range: tuple[float, float] = None
         activation: Union[ActivationString, Callable[[Tensor], Tensor]] = "swish"
         norm_first: bool = True
@@ -461,12 +462,14 @@ class RetNetDecoderLayer(nn.Module):
         dtype = self.config.dtype
         if self.norm_first:
             y, state = self.retention.forward_chunkwise(self.norm1(x.float()).to(dtype=dtype), start_idx=start_idx, prev_state=prev_state)
-            y = self.dropout(y)
+            if self.config.use_post_retention_dropout:
+                y = self.dropout(y)
             x = x + y
             x = x + self._feedforward_block(self.norm2(x.float()).to(dtype=dtype))
         else:
             y, state = self.retention.forward_chunkwise(x, start_idx=start_idx, prev_state=prev_state)
-            y = self.dropout(y)
+            if self.config.use_post_retention_dropout:
+                y = self.dropout(y)
             x = x + self.norm1(y.float()).to(dtype=dtype)
             x = x + self.norm2(self._feedforward_block(x).float()).to(dtype=dtype)
 
