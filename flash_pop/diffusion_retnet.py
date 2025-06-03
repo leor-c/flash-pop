@@ -126,25 +126,25 @@ class DiffusionRetNetDecoderLayer(nn.Module):
         return x
 
     def forward_chunkwise(
-            self, x: Tensor, start_idx: int, prev_state: Optional[Tensor] = None
+            self, x: Tensor, c: Tensor, start_idx: int, prev_state: Optional[Tensor] = None
     ) -> Tuple[Tensor, Tensor]:
         # retention block
-        x, gate = self.ada_ln1(x)
+        x, gate = self.ada_ln1(x, c)
         y, state = self.retention.forward_chunkwise(x, start_idx=start_idx, prev_state=prev_state)
         y = y * gate
         if self.use_post_retention_dropout:
             y = self.dropout(y)
         x = x + y
-        x, gate = self.ada_ln2(x)
+        x, gate = self.ada_ln2(x, c)
         x = x + self._feedforward_block(x) * gate
 
         return x, state
 
     def forward_recurrent(
-            self, x: Tensor, seq_idx: int, prev_state: Optional[Tensor] = None
+            self, x: Tensor, c: Tensor, seq_idx: int, prev_state: Optional[Tensor] = None
     ) -> Tuple[Tensor, Tensor]:
         # retention block
-        x, gate = self.ada_ln1(x)
+        x, gate = self.ada_ln1(x, c)
         y, state = self.retention.forward_recurrent(
             x, seq_idx=seq_idx, prev_state=prev_state
         )
@@ -152,13 +152,13 @@ class DiffusionRetNetDecoderLayer(nn.Module):
         if self.config.use_post_retention_dropout:
             y = self.dropout(y)
         x = x + y
-        x, gate = self.ada_ln2(x)
+        x, gate = self.ada_ln2(x, c)
         x = x + self._feedforward_block(x) * gate
 
         return x, state
 
-    def forward(self, x: Tensor, start_idx: int = 0, prev_state: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
-        return self.forward_chunkwise(x, start_idx, prev_state)
+    def forward(self, x: Tensor, c: Tensor, start_idx: int = 0, prev_state: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+        return self.forward_chunkwise(x, c, start_idx=start_idx, prev_state=prev_state)
 
 
 class DiffusionRetNetDecoder(nn.Module):
@@ -178,8 +178,9 @@ class DiffusionRetNetDecoder(nn.Module):
             device=layer_config.device,
             dtype=layer_config.dtype,
         )
-        self.layers = nn.ModuleList(self._build_layers(config.num_layers))
         d_model = layer_config.head_dim_v * layer_config.num_heads
+        self.t_embedder = TimestepEmbedder(d_model)
+        self.layers = nn.ModuleList(self._build_layers(config.num_layers))
         self.final_ada_ln = AdaLayerNorm(
             d_model,
             eps=layer_config.layer_norm_eps,
@@ -215,7 +216,7 @@ class DiffusionRetNetDecoder(nn.Module):
         return x, torch.stack(states)
 
     def forward_chunkwise(
-            self, x: Tensor, start_idx: int = 0, prev_states: Sequence[Optional[Tensor]] = ()
+            self, x: Tensor, diffusion_times: Tensor, start_idx: int = 0, prev_states: Sequence[Optional[Tensor]] = ()
     ) -> Tuple[Tensor, Tensor]:
         if prev_states is None or len(prev_states) == 0:
             prev_states = [None] * self.num_layers
@@ -223,18 +224,20 @@ class DiffusionRetNetDecoder(nn.Module):
             raise ValueError(
                 f"Expected {len(self.layers)} previous states, got {len(prev_states)}"
             )
+        
+        diffusion_times = self.t_embedder(diffusion_times)
 
         states: List[Tensor] = []
         for layer, prev_state in zip(self.layers, prev_states):
             assert isinstance(layer, DiffusionRetNetDecoderLayer)
-            x, state = layer.forward_chunkwise(x, start_idx, prev_state)
+            x, state = layer.forward_chunkwise(x, diffusion_times, start_idx, prev_state)
             states.append(state)
         
         # Final layer as in DiT:
-        x = self.final_ada_ln(x)
+        x = self.final_ada_ln(x, diffusion_times)
         x = self.final_linear(x)
 
         return x, torch.stack(states)
 
-    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
-        return self.forward_chunkwise(x)
+    def forward(self, x: Tensor, diffusion_times: Tensor, start_idx: int = 0, prev_states: Sequence[Optional[Tensor]] = ()) -> Tuple[Tensor, Tensor]:
+        return self.forward_chunkwise(x=x, diffusion_times=diffusion_times, start_idx=start_idx, prev_states=prev_states)
