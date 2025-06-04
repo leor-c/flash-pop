@@ -5,7 +5,8 @@ import torch
 from tilelang.profiler import do_bench
 from functools import partial
 
-from flash_pop import DiffusionRetNetDecoder, DiffusionRetNetDecoderLayer
+from flash_pop import DiffusionRetNetDecoder, DiffusionRetNetDecoderLayer, DiffusionRetNetFinalLayer
+from flash_pop.modules import TimestepEmbedder
 
 
 @dataclass()
@@ -53,14 +54,25 @@ def test_retnet(cfg: TestConfig):
     retnet = DiffusionRetNetDecoder(DiffusionRetNetDecoder.Config(
         layer_config=retnet_cfg, 
         num_layers=num_layers, 
-        out_dim=64,
     ))
-
+    final_layer = DiffusionRetNetFinalLayer(DiffusionRetNetFinalLayer.Config(
+        layer_config=retnet_cfg,
+        out_dim=64
+    ))
     d_model = cfg.head_dim_v * cfg.num_heads
+
+    t_embedder = TimestepEmbedder(d_model, device=device, dtype=torch.bfloat16)
+
     x = torch.randn(cfg.batch_size, cfg.seq_len, d_model, device=device, dtype=torch.bfloat16)
     t = torch.randn(cfg.batch_size, cfg.seq_len // 4, device=device, dtype=torch.bfloat16)
+    t = t_embedder(t)
 
-    run = partial(retnet, x=x, diffusion_times=t)
+    # basic test:
+    with torch.no_grad():
+        final_layer(retnet(x=x, c=t)[0], t)
+
+    # Benchmark seq model:
+    run = partial(retnet, x=x, c=t)
 
     # test case: t per frame
     with torch.no_grad():
@@ -69,14 +81,16 @@ def test_retnet(cfg: TestConfig):
 
     # test case: t shape = x shape
     t = torch.randn(cfg.batch_size, cfg.seq_len, device=device, dtype=torch.bfloat16)
-    run = partial(retnet, x=x, diffusion_times=t)
+    t = t_embedder(t)
+    run = partial(retnet, x=x, c=t)
     with torch.no_grad():
         latency = do_bench(run, warmup=100, rep=100)
     print(f"RetNet latency (ms): {latency}")
 
     # test case: single t per batch sample
     t = torch.randn(cfg.batch_size, device=device, dtype=torch.bfloat16)
-    run = partial(retnet, x=x, diffusion_times=t)
+    t = t_embedder(t)
+    run = partial(retnet, x=x, c=t)
     with torch.no_grad():
         latency = do_bench(run, warmup=100, rep=100)
     print(f"RetNet latency (ms): {latency}")
