@@ -1,6 +1,6 @@
 
 # Flash POP
-A hardware-aware efficient implementation of [Retention](https://arxiv.org/abs/2307.08621) and [POP](https://arxiv.org/abs/2402.05643) Retention.
+A hardware-aware efficient implementation of [Retention](https://arxiv.org/abs/2307.08621) and [POP](https://arxiv.org/abs/2402.05643) Retention - Retention augmented with a Parallel Observation Pediction (POP) mechanism.
 
 
 
