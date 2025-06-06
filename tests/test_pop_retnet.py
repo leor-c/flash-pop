@@ -16,7 +16,7 @@ class TestConfig:
 
 def test_pop_retnet(cfg: TestConfig):
     device = torch.device("cuda")
-    from pop_retnet import POPRetNetDecoder, POPDecoderLayer
+    from flash_pop.pop_retnet import POPRetNetDecoder, POPDecoderLayer
     retnet_cfg = POPDecoderLayer.Config(
         block_size=32,
         num_heads=cfg.num_heads,

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import torch
 from tilelang.profiler import do_bench
 
-from retnet import MultiScaleRetention, RetNetDecoderLayer, RetNetDecoder
+from flash_pop.retnet import MultiScaleRetention, RetNetDecoderLayer, RetNetDecoder
 
 
 @dataclass()
