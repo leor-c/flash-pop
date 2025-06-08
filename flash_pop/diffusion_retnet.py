@@ -268,7 +268,9 @@ class DiffusionRetNetDecoder(nn.Module):
         return self.forward_chunkwise(x=x, c=c, recurrent_state=recurrent_state)
     
     def _validate_and_init_state(self, recurrent_state: RecurrentState):
-        if recurrent_state is None or recurrent_state.state is None:
+        if recurrent_state is None:
+            recurrent_state = RecurrentState()
+        if recurrent_state.state is None:
             recurrent_state.state = [None] * self.num_layers
             recurrent_state.index = 0
         elif len(recurrent_state.state) != len(self.layers):
