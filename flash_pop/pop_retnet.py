@@ -8,6 +8,7 @@ from einops import rearrange, einsum, repeat
 from flash_pop.xpos_emb import XPos
 from flash_pop.retnet import MultiScaleRetention, RetNetDecoderLayer, RetNetDecoder
 from flash_pop.pop_retention import flash_pop_retention
+from flash_pop.recurrent_state import RecurrentState
 from loguru import logger
 
 
@@ -200,10 +201,9 @@ class POPRetNetDecoder(RetNetDecoder):
     def pop_forward(
             self,
             x: Tensor,
-            start_idx: int = 0,
-            prev_states: Optional[tuple[Tensor, ...]] = (),
+            recurrent_state: RecurrentState = None,
             suffixes: Optional[Tensor] = None,
-    ) -> tuple[Tensor, Tensor, Optional[Tensor]]:
+    ) -> tuple[Tensor, RecurrentState, Optional[Tensor]]:
         """
 
         :param x: Tensor of shape (batch_size, seq_len, num_heads * dim_v).
@@ -212,35 +212,32 @@ class POPRetNetDecoder(RetNetDecoder):
         :param suffixes: Tensor of shape (batch_size, num_blocks, sfx_seq_len, num_heads * dim_v).
         :return:
         """
-        if prev_states is None or len(prev_states) == 0:
-            prev_states = [None] * self.num_layers
-        elif len(prev_states) != len(self.layers):
-            raise ValueError(
-                f"Expected {len(self.layers)} previous states, got {len(prev_states)}"
-            )
+        self._validate_and_init_state(recurrent_state)
 
         suffixes_start_indices = None
         if suffixes is not None:
             assert suffixes.dim() == 4, f"Got {suffixes.dim()}"
             suffixes_start_indices = _get_suffixes_start_indices(
-                x.size(0), suffixes.size(1), start_idx, self.layer_config.block_size, x.device
+                x.size(0), suffixes.size(1), recurrent_state.index, self.layer_config.block_size, x.device
             )
             suffixes = suffixes.flatten(0, 1)
 
         states: list[Tensor] = []
-        for layer, prev_state in zip(self.layers, prev_states):
+        for layer, state_i in zip(self.layers, recurrent_state.state):
             assert isinstance(layer, POPDecoderLayer)
 
             x, state, suffixes = layer.pop_forward(
                 x,
-                start_idx,
-                prev_state,
+                recurrent_state.index,
+                state_i,
                 suffixes,
                 suffixes_start_indices=suffixes_start_indices
             )
             states.append(state)
         if suffixes is not None:
             suffixes = rearrange(suffixes, '(b n) t d -> b n t d', b=x.size(0))
-        return x, torch.stack(states), suffixes
-
-
+        new_state = RecurrentState(
+            state=torch.stack(states),
+            index=recurrent_state.index + x.size(1)
+        )
+        return x, new_state, suffixes

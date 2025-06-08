@@ -21,6 +21,7 @@ from flash_pop.xpos_emb import XPos
 from flash_pop.retnet import ActivationString, _get_activation_fn, MultiScaleRetention
 from flash_pop.modules.adaln import AdaLayerNorm, AdaLayerNormZero
 from flash_pop.modules.timestep import TimestepEmbedder
+from flash_pop.recurrent_state import RecurrentState
 
 
 class DiffusionRetNetDecoderLayer(nn.Module):
@@ -229,26 +230,21 @@ class DiffusionRetNetDecoder(nn.Module):
         return [DiffusionRetNetDecoderLayer(self.layer_config, self.xpos_embedder) for _ in range(num_layers)]
 
     def forward_recurrent(
-            self, x: Tensor, seq_idx: int, prev_states: Sequence[Optional[Tensor]] = ()
-    ) -> Tuple[Tensor, Tensor]:
-        if prev_states is None or len(prev_states) == 0:
-            prev_states = [None] * self.num_layers
-        elif len(prev_states) != len(self.layers):
-            raise ValueError(
-                f"Expected {len(self.layers)} previous states, got {len(prev_states)}"
-            )
+            self, x: Tensor, recurrent_state: RecurrentState = None
+    ) -> Tuple[Tensor, RecurrentState]:
+        self._validate_and_init_state(recurrent_state)
 
         states: List[Tensor] = []
-        for layer, prev_state in zip(self.layers, prev_states):
+        for layer, state_i in zip(self.layers, recurrent_state.state):
             assert isinstance(layer, DiffusionRetNetDecoderLayer)
-            x, state = layer.forward_recurrent(x, seq_idx, prev_state)
+            x, state = layer.forward_recurrent(x, recurrent_state.index, state_i)
             states.append(state)
 
-        return x, torch.stack(states)
+        return x, RecurrentState(torch.stack(states), recurrent_state.index + 1)
 
     def forward_chunkwise(
-            self, x: Tensor, c: Tensor, start_idx: int = 0, prev_states: Sequence[Optional[Tensor]] = ()
-    ) -> Tuple[Tensor, Tensor]:
+            self, x: Tensor, c: Tensor, recurrent_state: RecurrentState = None
+    ) -> Tuple[Tensor, RecurrentState]:
         """
         x: Input sequence of shape (B, T, D) = (batch, temportal dim, features dim)
         c: Conditioning signal. Can take various shapes:
@@ -258,20 +254,27 @@ class DiffusionRetNetDecoder(nn.Module):
         is shared by all elements of its corresponding subsequence.
         (B, D): all time steps share the same conditioning signal.
         """
-        if prev_states is None or len(prev_states) == 0:
-            prev_states = [None] * self.num_layers
-        elif len(prev_states) != len(self.layers):
-            raise ValueError(
-                f"Expected {len(self.layers)} previous states, got {len(prev_states)}"
-            )
+        self._validate_and_init_state(recurrent_state)
 
         states: List[Tensor] = []
-        for layer, prev_state in zip(self.layers, prev_states):
+        for layer, state_i in zip(self.layers, recurrent_state.state):
             assert isinstance(layer, DiffusionRetNetDecoderLayer)
-            x, state = layer.forward_chunkwise(x, c, start_idx, prev_state)
+            x, state = layer.forward_chunkwise(x, c, recurrent_state.index, state_i)
             states.append(state)
 
-        return x, torch.stack(states)
+        return x, RecurrentState(torch.stack(states), recurrent_state.index + x.size(1))
 
-    def forward(self, x: Tensor, c: Tensor, start_idx: int = 0, prev_states: Sequence[Optional[Tensor]] = ()) -> Tuple[Tensor, Tensor]:
-        return self.forward_chunkwise(x=x, c=c, start_idx=start_idx, prev_states=prev_states)
+    def forward(self, x: Tensor, c: Tensor, recurrent_state: RecurrentState = None) -> Tuple[Tensor, RecurrentState]:
+        return self.forward_chunkwise(x=x, c=c, recurrent_state=recurrent_state)
+    
+    def _validate_and_init_state(self, recurrent_state: RecurrentState):
+        if recurrent_state is None or recurrent_state.state is None:
+            recurrent_state.state = [None] * self.num_layers
+            recurrent_state.index = 0
+        elif len(recurrent_state.state) != len(self.layers):
+            raise ValueError(
+                f"Expected {len(self.layers)} previous states, got {len(recurrent_state.state)}"
+            )
+        assert recurrent_state.state is not None and recurrent_state.index is not None
+
+        return recurrent_state
