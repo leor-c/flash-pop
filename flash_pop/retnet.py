@@ -503,6 +503,8 @@ class RetNetDecoderLayer(nn.Module):
 class RetNetDecoder(nn.Module):
     def __init__(self, layer_config: RetNetDecoderLayer.Config, num_layers: int):
         super().__init__()
+        if layer_config.head_dim_qk is None:
+            layer_config.head_dim_qk = layer_config.head_dim_v
         self.layer_config = layer_config
         self.num_layers = num_layers
         self.xpos_embedder = XPos(

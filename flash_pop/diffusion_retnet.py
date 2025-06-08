@@ -215,6 +215,8 @@ class DiffusionRetNetDecoder(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         layer_config = config.layer_config
+        if layer_config.head_dim_qk is None:
+            layer_config.head_dim_qk = layer_config.head_dim_v
         self.layer_config = config.layer_config
         device = layer_config.device
         dtype = layer_config.dtype
