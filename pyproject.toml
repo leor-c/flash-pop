@@ -1,6 +1,6 @@
 [project]
 name = "flash-pop"
-version = "0.2.4"
+version = "0.3.0"
 description = "A hardware-aware efficient implementation of RetNet and POP."
 license = { text = "GPL-3.0-or-later" }
 readme = "README.md"

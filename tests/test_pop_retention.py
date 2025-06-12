@@ -5,7 +5,7 @@ import torch
 from tilelang.profiler import do_bench
 from loguru import logger
 
-from flash_pop.fused_retention.reference import ref_program_
+from flash_pop.fused_retention.reference import chunkwise_retention_
 from flash_pop.pop_retention import flash_pop_retention
 from tests.test_fused_retention import Config as RetNetConfig, generate_inputs, get_err_ratio, log_error_info, detail_level
 
@@ -19,7 +19,7 @@ def ref_pop(Q, K, V, prev_state, head_decays, block_size: int = 512, *args):
     # gn = torch.nn.LayerNorm(normalized_shape=V.size(3), device=Q.device, dtype=Q.dtype)
     for i in range(ceil(seq_len / block_size)):
         start, end = i * block_size, (i + 1) * block_size
-        res_t, state_t = ref_program_(
+        res_t, state_t = chunkwise_retention_(
             Q[:, start:end],
             K[:, start:end],
             V[:, start:end],

@@ -17,6 +17,7 @@ from einops import rearrange, einsum, repeat
 from torch import Tensor
 
 from flash_pop.fused_retention import fused_chunk_retention
+from flash_pop.fused_retention.reference import chunkwise_retention
 from flash_pop.xpos_emb import XPos
 from flash_pop.recurrent_state import RecurrentState
 
@@ -133,6 +134,9 @@ class MultiScaleRetention(nn.Module):
         group_norm_eps: float = 1e-6
         device: Optional[Union[torch.device, str]] = torch.device('cuda')
         dtype: Optional[torch.dtype] = torch.bfloat16
+        use_fused_version: bool = True
+        chunk_size: int = 512  # only valid when `use_fused_version` is False.
+
     def __init__(
             self,
             config: Config,
@@ -144,6 +148,7 @@ class MultiScaleRetention(nn.Module):
             activation = _get_activation_fn(config.activation)
 
         super().__init__()
+        self.config = config
         self.num_heads = config.num_heads
         self.head_dim_v = config.head_dim_v
         self.head_dim_qk = config.head_dim_v if config.head_dim_qk is None else config.head_dim_qk
@@ -230,9 +235,14 @@ class MultiScaleRetention(nn.Module):
             v: Tensor,
             prev_state: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        retention, state = fused_chunk_retention(
-            q, k, v, prev_state, self.head_decays
-        )
+        if self.config.use_fused_version:
+            retention, state = fused_chunk_retention(
+                q, k, v, prev_state, self.head_decays
+            )
+        else:
+            retention, state = chunkwise_retention(
+                q, k, v, prev_state, self.head_decays, chunk_size=self.config.chunk_size
+            )
         return retention, state
 
     def _retention_chunkwise(
@@ -376,6 +386,8 @@ class RetNetDecoderLayer(nn.Module):
         layer_norm_eps: float = 1e-6
         device: Optional[Union[torch.device, str]] = torch.device('cuda')
         dtype: Optional[torch.dtype] = torch.bfloat16
+        use_fused_version: bool = True
+        chunk_size: int = 512  # only valid when `use_fused_version` is False.
 
     def __init__(
         self,
@@ -438,6 +450,8 @@ class RetNetDecoderLayer(nn.Module):
                 activation=self.activation,
                 device=self.config.device,
                 dtype=self.config.dtype,
+                use_fused_version=self.config.use_fused_version,
+                chunk_size=self.config.chunk_size,
             ),
             xpos_embedder=xpos_embedder,
         )

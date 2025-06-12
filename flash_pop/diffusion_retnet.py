@@ -44,6 +44,8 @@ class DiffusionRetNetDecoderLayer(nn.Module):
         ada_ln_lora_dim: Optional[int] = None
         device: Optional[Union[torch.device, str]] = torch.device('cuda')
         dtype: Optional[torch.dtype] = torch.bfloat16
+        use_fused_version: bool = True
+        chunk_size: int = 512  # only valid when `use_fused_version` is False.
 
     def __init__(
         self,
@@ -108,6 +110,8 @@ class DiffusionRetNetDecoderLayer(nn.Module):
                 activation=self.activation,
                 device=self.config.device,
                 dtype=self.config.dtype,
+                use_fused_version=self.config.use_fused_version,
+                chunk_size=self.config.chunk_size,
             ),
             xpos_embedder=xpos_embedder,
         )

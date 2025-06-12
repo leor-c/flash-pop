@@ -7,7 +7,7 @@ from einops import rearrange, einsum
 from . import _get_decay_mask
 
 
-def ref_program_(Q, K, V, prev_state, head_decays):
+def chunkwise_retention_(Q, K, V, prev_state, head_decays):
     qk = torch.einsum('bqhd,bkhd->bhqk', Q, K).tril()
 
     device, dtype = Q.device, Q.dtype
@@ -50,7 +50,7 @@ def ref_program_(Q, K, V, prev_state, head_decays):
     return o.to(dtype=dtype), state.to(dtype=dtype)
 
 
-def ref_program(Q, K, V, prev_state, head_decays, chunk_size: int = 512, *args):
+def chunkwise_retention(Q, K, V, prev_state, head_decays, chunk_size: int = 512, *args):
     seq_len = Q.size(1)
     res = []
     state_t = prev_state
@@ -58,7 +58,7 @@ def ref_program(Q, K, V, prev_state, head_decays, chunk_size: int = 512, *args):
     # gn = torch.nn.LayerNorm(normalized_shape=V.size(3), device=Q.device, dtype=Q.dtype)
     for i in range(ceil(seq_len / chunk_size)):
         start, end = i * chunk_size, (i + 1) * chunk_size
-        res_t, state_t = ref_program_(
+        res_t, state_t = chunkwise_retention_(
             Q[:, start:end],
             K[:, start:end],
             V[:, start:end],
